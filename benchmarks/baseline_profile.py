@@ -16,6 +16,10 @@ def benchmark(sequence_length, dim_head = 64, batch = 1, heads = 1, n_runs=100):
     K = torch.randn(batch, heads, sequence_length, dim_head, device='cuda', dtype=torch.float16)
     V = torch.randn(batch, heads, sequence_length, dim_head, device='cuda', dtype=torch.float16)
 
+    for j in range(10):
+        j = standard_attention(Q, K, V)
+    torch.cuda.synchronize()
+
     start = time.perf_counter()
 
     for i in range(n_runs):
