@@ -27,7 +27,7 @@ def benchmark(sequence_length, dim_head = 64, batch = 1, heads = 1, n_runs=100):
     torch.cuda.synchronize()
     end = time.perf_counter()
 
-    elapsed_time = (end - start) * 1000 / n_runs
+    elapsed_time = ((end - start) * 1000 / n_runs) / 1000
 
     bytes_accessed = (
     3 * batch * heads * sequence_length * dim_head * 2 +   # Q, K, V (fp16)
