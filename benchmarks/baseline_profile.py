@@ -36,7 +36,7 @@ def benchmark(sequence_length, dim_head = 64, batch = 1, heads = 1, n_runs=100):
     )
     bandwidth_tb = (bytes_accessed / (elapsed_time_ms / 1000)) / 1e9  # GB/s
 
-    print(f"Sequence Length: {sequence_length:5d}, Time per run: {elapsed_time:.3f} ms, Bandwidth: {bandwidth_tb:.2f} GB/s, HBM Accessed: {bytes_accessed / 1e9:.4f} GB")
+    print(f"Sequence Length: {sequence_length:5d}, Time per run: {elapsed_time_ms:.3f} ms, Bandwidth: {bandwidth_tb:.2f} GB/s, HBM Accessed: {bytes_accessed / 1e9:.4f} GB")
 
     if __name__ == "__main__":
         sequence_lengths = [128, 256, 512, 1024, 2048]
