@@ -27,14 +27,14 @@ def benchmark(sequence_length, dim_head = 64, batch = 1, heads = 1, n_runs=100):
     torch.cuda.synchronize()
     end = time.perf_counter()
 
-    elapsed_time = ((end - start) * 1000 / n_runs) / 1000
+    elapsed_time_ms = ((end - start) * 1000) / 1000
 
     bytes_accessed = (
     3 * batch * heads * sequence_length * dim_head * 2 +   # Q, K, V (fp16)
     2 * batch * heads * sequence_length * sequence_length * 2 +   # S, P (NxN, fp16)
     batch * heads * sequence_length * dim_head * 2           # O
     )
-    bandwidth_tb = (bytes_accessed / elapsed_time) / 1e9  # GB/s
+    bandwidth_tb = (bytes_accessed / (elapsed_time_ms / 1000)) / 1e9  # GB/s
 
     print(f"Sequence Length: {sequence_length:5d}, Time per run: {elapsed_time:.3f} ms, Bandwidth: {bandwidth_tb:.2f} GB/s, HBM Accessed: {bytes_accessed / 1e9:.4f} GB")
 
