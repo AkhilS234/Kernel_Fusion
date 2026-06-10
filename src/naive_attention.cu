@@ -98,7 +98,7 @@ int main () {
 
     attention_scores<<<gridDim, blockDim>>>(device_query, device_key, device_S, dim, N);
     softmax<<<gridDim, blockDim>>>(device_S, device_P, N);
-    output<<<gridDim, blockDim>>>(device_P, device_value, device_O. dim, N);
+    output<<<gridDim, blockDim>>>(device_P, device_value, device_O, dim, N);
 
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
