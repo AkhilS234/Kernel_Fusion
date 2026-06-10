@@ -38,12 +38,13 @@ def benchmark(sequence_length, dim_head = 64, batch = 1, heads = 1, n_runs=100):
 
     print(f"Sequence Length: {sequence_length:5d}, Time per run: {elapsed_time_ms:.3f} ms, Bandwidth: {bandwidth_tb:.2f} GB/s, HBM Accessed: {bytes_accessed / 1e9:.4f} GB")
 
-    if __name__ == "__main__":
-        sequence_lengths = [128, 256, 512, 1024, 2048]
-        for seq_len in sequence_lengths:
-            benchmark(seq_len)
 
-# Define the standard attention function in PyTorch as the baseline implentation. 
+if __name__ == "__main__":
+    sequence_lengths = [128, 256, 512, 1024, 2048]
+    for seq_len in sequence_lengths:
+        benchmark(seq_len)
+
+# Define the standard attention function in PyTorch as the baseline implentation.
 # Then benchmark it across sequence lengths 128-2048 by measuring the average latency over 100 runs, 
 # and calculating how many bytes were moved between the HBM and the SM during the computation. 
 # Converting that to the effective HBM bandwidth the kernel achieved in GB/s

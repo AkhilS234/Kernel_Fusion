@@ -12,7 +12,7 @@ __global__ void attention_scores(float *matrix_Q, float *matrix_K, float *matrix
     float sum = 0.0f;
 
     if (row < N && col < N) {
-        for (int i = 0; i < N; i++) {
+        for (int i = 0; i < dim; i++) {
             sum += matrix_Q[row * dim + i] * matrix_K[col * dim + i];
         }
         matrix_S[row * N + col] = sum / sqrtf((float)dim);
@@ -66,12 +66,19 @@ int main () {
 
     float *host_output = new float[N * dim];
 
-    for (int i = 0; i < N * dim; i++) {
-        host_query[i] = (float)rand() / RAND_MAX;
-        host_key[i]   = (float)rand() / RAND_MAX;
-        host_value[i] = (float)rand() / RAND_MAX;
-        host_output[i] = (float)rand() / RAND_MAX;
+    FILE *fq = fopen("outputs/input_Q.bin", "rb");
+    FILE *fk = fopen("outputs/input_K.bin", "rb");
+    FILE *fv = fopen("outputs/input_V.bin", "rb");
+    if (!fq || !fk || !fv) {
+        printf("Error: could not open input files in outputs/\n");
+        return 1;
     }
+    fread(host_query, sizeof(float), N * dim, fq);
+    fread(host_key, sizeof(float), N * dim, fk);
+    fread(host_value, sizeof(float), N * dim, fv);
+    fclose(fq);
+    fclose(fk);
+    fclose(fv);
 
     float *device_query, *device_key, *device_value;
     float *device_S, *device_P, *device_O;
@@ -108,7 +115,21 @@ int main () {
     printf("Time taken: %f ms\n", ms);
 
     cudaMemcpy(host_output, device_O, N * dim * sizeof(float), cudaMemcpyDeviceToHost);
-    printf("Output[0][0]: %f\n", host_value[0]);
+    printf("Output[0][0]: %f\n", host_output[0]);
+
+    float bytes_accessed = (
+    3.0f * N * dim * sizeof(float) +   
+    2.0f * N * N * sizeof(float) +     
+    1.0f * N * dim * sizeof(float)     
+    );
+
+    float bandwidth_gb = (bytes_accessed / (ms / 1000.0f)) / 1e9f;
+    printf("Bandwidth: %.2f GB/s\n", bandwidth_gb);
+    printf("HBM accessed: %.4f GB\n", bytes_accessed / 1e9f);
+
+    FILE *f = fopen("outputs/naive_output.bin", "wb");
+    fwrite(host_output, sizeof(float), N * dim, f);
+    fclose(f);
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
@@ -121,4 +142,7 @@ int main () {
     delete[] host_query;
     delete[] host_key;
     delete[] host_value;
+    delete[] host_output;
+
+    return 0;
 }
