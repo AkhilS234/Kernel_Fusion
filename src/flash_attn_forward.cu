@@ -1,20 +1,26 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <math.h>
 
-#define TILE_SIZE 64
+#define TILE_SIZE 32
+#define MAX_DIM 64
 
-__global__ void flash_attention(float *Q, float *K, float *V, float *matrix_O, int dim, int N) {
+__global__ void flash_attention(float *matrix_Q, float *matrix_K, float *matrix_V, float *matrix_O, int dim, int N) {
 
-    __shared__ float tile_Q[TILE_SIZE][TILE_SIZE];
-    __shared__ float tile_K[TILE_SIZE][TILE_SIZE];
-    __shared__ float tile_V[TILE_SIZE][TILE_SIZE];
+    int batch_idx = blockIdx.z;
+    const float *Q = matrix_Q + (size_t)batch_idx * N * dim;
+    const float *K = matrix_K + (size_t)batch_idx * N * dim;
+    const float *V = matrix_V + (size_t)batch_idx * N * dim;
+    float *matrix_O_b = matrix_O + (size_t)batch_idx * N * dim;
+
+    __shared__ float tile_Q[TILE_SIZE][MAX_DIM];
+    __shared__ float tile_K[TILE_SIZE][MAX_DIM];
+    __shared__ float tile_V[TILE_SIZE][MAX_DIM];
 
     int q_row = blockIdx.y * TILE_SIZE + threadIdx.y;
-    int k_col = blockIdx.x * TILE_SIZE + threadIdx.x;
-    float sum = 0.0f;
 
-    if (q_row < N ) {
-        for (int d = threadIdx.x;  d < dim; d += TILE_SIZE) {
+    if (q_row < N) {
+        for (int d = threadIdx.x; d < dim; d += blockDim.x) {
             tile_Q[threadIdx.y][d] = Q[q_row * dim + d];
         }
     }
@@ -22,19 +28,20 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *matrix_O, i
 
     float m_old = -INFINITY;
     float l_old = 0.0f;
-    float acc[64] = {0.0f};
+    float acc[MAX_DIM] = {0.0f};
 
     for (int k_tile = 0; k_tile < N; k_tile += TILE_SIZE) {
         int k_row = k_tile + threadIdx.y;
         if (k_row < N) {
-            for (int d = threadIdx.x; d < dim; d += TILE_SIZE) {
+            for (int d = threadIdx.x; d < dim; d += blockDim.x) {
                 tile_K[threadIdx.y][d] = K[k_row * dim + d];
                 tile_V[threadIdx.y][d] = V[k_row * dim + d];
             }
         }
         __syncthreads();
 
-        for (int k = 0; k < TILE_SIZE; k++) {
+        int tile_rows = min(TILE_SIZE, N - k_tile);
+        for (int k = 0; k < tile_rows; k++) {
             float val = 0.0f;
             for (int i = 0; i < dim; i++) {
                 val += tile_Q[threadIdx.y][i] * tile_K[k][i];
@@ -46,7 +53,7 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *matrix_O, i
             float l_new = expf(m_old - m_new) * l_old + expf(val - m_new);
             float p = expf(val - m_new);
 
-            for (int d=0; d < dim; d++) {
+            for (int d = 0; d < dim; d++) {
                 acc[d] = acc[d] * expf(m_old - m_new) + p * tile_V[k][d];
             }
 
@@ -59,20 +66,28 @@ __global__ void flash_attention(float *Q, float *K, float *V, float *matrix_O, i
 
     if (q_row < N) {
         for (int d = 0; d < dim; d++) {
-            matrix_O[q_row * dim + d] = acc[d] / l_old;
+            matrix_O_b[q_row * dim + d] = acc[d] / l_old;
         }
     }
 }
 
-int main() {
+int main(int argc, char **argv) {
 
-    int N = 1024;
-    int dim = 64;
+    int N = argc > 1 ? atoi(argv[1]) : 1024;
+    int dim = argc > 2 ? atoi(argv[2]) : 64;
+    int batch = argc > 3 ? atoi(argv[3]) : 1;
 
-    float *host_query = new float[N * dim];
-    float *host_key = new float[N * dim];
-    float *host_value = new float[N * dim];
-    float *host_output = new float[N * dim];
+    if (dim > MAX_DIM) {
+        printf("Error: dim %d exceeds MAX_DIM %d supported by this kernel\n", dim, MAX_DIM);
+        return 1;
+    }
+
+    size_t qkv_elems = (size_t)batch * N * dim;
+
+    float *host_query = new float[qkv_elems];
+    float *host_key = new float[qkv_elems];
+    float *host_value = new float[qkv_elems];
+    float *host_output = new float[qkv_elems];
 
     FILE *fq = fopen("outputs/input_Q.bin", "rb");
     FILE *fk = fopen("outputs/input_K.bin", "rb");
@@ -81,9 +96,9 @@ int main() {
         printf("Error: could not open input files in outputs/\n");
         return 1;
     }
-    fread(host_query, sizeof(float), N * dim, fq);
-    fread(host_key, sizeof(float), N * dim, fk);
-    fread(host_value, sizeof(float), N * dim, fv);
+    fread(host_query, sizeof(float), qkv_elems, fq);
+    fread(host_key, sizeof(float), qkv_elems, fk);
+    fread(host_value, sizeof(float), qkv_elems, fv);
     fclose(fq);
     fclose(fk);
     fclose(fv);
@@ -91,22 +106,19 @@ int main() {
     float *d_matrixQ;
     float *d_matrixK;
     float *d_matrixV;
-
-    float *d_matrixS;
-    float *d_matrixP;
     float *d_matrixO;
 
-    cudaMalloc(&d_matrixQ, N * dim * sizeof(float));
-    cudaMalloc(&d_matrixK, N * dim * sizeof(float));
-    cudaMalloc(&d_matrixV, N * dim * sizeof(float));
-    cudaMalloc(&d_matrixO, N * dim * sizeof(float));
+    cudaMalloc(&d_matrixQ, qkv_elems * sizeof(float));
+    cudaMalloc(&d_matrixK, qkv_elems * sizeof(float));
+    cudaMalloc(&d_matrixV, qkv_elems * sizeof(float));
+    cudaMalloc(&d_matrixO, qkv_elems * sizeof(float));
 
-    cudaMemcpy(d_matrixQ, host_query, N * dim * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_matrixK, host_key, N * dim * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_matrixV, host_value, N * dim * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_matrixQ, host_query, qkv_elems * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_matrixK, host_key, qkv_elems * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_matrixV, host_value, qkv_elems * sizeof(float), cudaMemcpyHostToDevice);
 
-    dim3 blockDim(32, 32); 
-    dim3 gridDim(1, 16);
+    dim3 blockDim(TILE_SIZE, TILE_SIZE);
+    dim3 gridDim(1, (N + TILE_SIZE - 1) / TILE_SIZE, batch);
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -122,11 +134,16 @@ int main() {
     cudaEventElapsedTime(&ms, start, stop);
     printf("Time taken: %f ms\n", ms);
 
-    cudaMemcpy(host_output, d_matrixO, N * dim * sizeof(float), cudaMemcpyDeviceToHost);
-    FILE *fo = fopen("outputs/flash_attn_output.bin", "wb");
-    fwrite(host_output, sizeof(float), N * dim, fo);
-    fclose(fo);
+    cudaMemcpy(host_output, d_matrixO, qkv_elems * sizeof(float), cudaMemcpyDeviceToHost);
 
+    float bytes_accessed = 4.0f * batch * N * dim * sizeof(float); // Q, K, V read once, O written once
+    float bandwidth_gb = (bytes_accessed / (ms / 1000.0f)) / 1e9f;
+    printf("Bandwidth: %.2f GB/s\n", bandwidth_gb);
+    printf("HBM accessed: %.4f GB\n", bytes_accessed / 1e9f);
+
+    FILE *fo = fopen("outputs/output_S.bin", "wb");
+    fwrite(host_output, sizeof(float), qkv_elems, fo);
+    fclose(fo);
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
@@ -142,14 +159,14 @@ int main() {
     return 0;
 }
 
-/* 
-Implements the fused FlashAttention forward pass. One thread is permanently assigned to one row of Q. 
-Each thread loads its Q row once, then sweeps through all of K and V — fetched in TILE_SIZE-sized chunks from HBM 
-into shared memory to minimize memory traffic. Within each tile, the thread sequentially processes every row: computing 
-the scaled dot product, updating the running softmax statistics (m, l) via the online-softmax merge formula, and 
-accumulating the weighted V contribution into a private output buffer (acc), rescaling previous contributions whenever 
-the running max changes. S and P are never materialized to HBM — they exist only transiently in registers. After all of 
-K/V has been processed, each thread normalizes its accumulator by the final l and writes one row directly to O. Net effect: 
-replaces the naive kernel's three separate HBM round trips (S, P, O) with a single fused pass that touches HBM only to read 
+/*
+Implements the fused FlashAttention forward pass. One thread is permanently assigned to one row of Q.
+Each thread loads its Q row once, then sweeps through all of K and V — fetched in TILE_SIZE-sized chunks from HBM
+into shared memory to minimize memory traffic. Within each tile, the thread sequentially processes every row: computing
+the scaled dot product, updating the running softmax statistics (m, l) via the online-softmax merge formula, and
+accumulating the weighted V contribution into a private output buffer (acc), rescaling previous contributions whenever
+the running max changes. S and P are never materialized to HBM — they exist only transiently in registers. After all of
+K/V has been processed, each thread normalizes its accumulator by the final l and writes one row directly to O. Net effect:
+replaces the naive kernel's three separate HBM round trips (S, P, O) with a single fused pass that touches HBM only to read
 Q/K/V once and write O once.
 */
