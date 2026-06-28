@@ -10,7 +10,7 @@ __global__ void online_softmax(float *matrix_S, float *matrix_P, int N) {
         float l = 0.0f;
 
         for (int j = 0; j < N; j++) {
-            float val = matrix_S[row * N + j]
+            float val = matrix_S[row * N + j];
             float m_new = max(m, val);
             l = expf(m-m_new) * l + expf(val - m_new);
             m = m_new;
