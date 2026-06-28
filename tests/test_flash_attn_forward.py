@@ -14,7 +14,7 @@ Q.numpy().tofile("outputs/input_Q.bin")
 K.numpy().tofile("outputs/input_K.bin")
 V.numpy().tofile("outputs/input_V.bin")
 
-subprocess.run(["./flash_attn_forward"])
+subprocess.run(["./build/flash_attn_forward", str(N), str(dim), "1"])
 
 Q_sdpa = Q.unsqueeze(0).unsqueeze(0)  
 K_sdpa = K.unsqueeze(0).unsqueeze(0)
