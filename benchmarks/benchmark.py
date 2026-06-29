@@ -1,6 +1,7 @@
 import re
 import subprocess
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -8,17 +9,21 @@ import torch.nn.functional as F
 
 TIME_RE = re.compile(r"Time taken:\s*([\d.]+)\s*ms")
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+BUILD_DIR = REPO_ROOT / "build"
+OUTPUTS_DIR = REPO_ROOT / "outputs"
 
-def run_binary(binary, N, dim, batch, output_file):
+
+def run_binary(binary_name, N, dim, batch, output_file):
     result = subprocess.run(
-        [binary, str(N), str(dim), str(batch)],
-        capture_output=True, text=True, cwd="."
+        [str(BUILD_DIR / binary_name), str(N), str(dim), str(batch)],
+        capture_output=True, text=True, cwd=str(REPO_ROOT)
     )
     match = TIME_RE.search(result.stdout)
     if match is None:
-        raise RuntimeError(f"{binary} failed or printed no timing:\n{result.stdout}\n{result.stderr}")
+        raise RuntimeError(f"{binary_name} failed or printed no timing:\n{result.stdout}\n{result.stderr}")
     ms = float(match.group(1))
-    output = torch.tensor(np.fromfile(output_file, dtype=np.float32)).reshape(batch, N, dim)
+    output = torch.tensor(np.fromfile(OUTPUTS_DIR / output_file, dtype=np.float32)).reshape(batch, N, dim)
     return ms, output
 
 
@@ -51,12 +56,12 @@ def sweep(seq_lens, head_dims, batches):
                 K = torch.randn(batch, N, dim, dtype=torch.float32)
                 V = torch.randn(batch, N, dim, dtype=torch.float32)
 
-                Q.numpy().tofile("outputs/input_Q.bin")
-                K.numpy().tofile("outputs/input_K.bin")
-                V.numpy().tofile("outputs/input_V.bin")
+                Q.numpy().tofile(OUTPUTS_DIR / "input_Q.bin")
+                K.numpy().tofile(OUTPUTS_DIR / "input_K.bin")
+                V.numpy().tofile(OUTPUTS_DIR / "input_V.bin")
 
-                naive_time, _ = run_binary("./naive_attention", N, dim, batch, "outputs/naive_output.bin")
-                flash_time, _ = run_binary("./flash_attn_forward", N, dim, batch, "outputs/output_S.bin")
+                naive_time, _ = run_binary("naive_attention", N, dim, batch, "naive_output.bin")
+                flash_time, _ = run_binary("flash_attn_forward", N, dim, batch, "output_S.bin")
                 pytorch_time, _ = sdpa_ms(Q, K, V)
 
                 speedup = naive_time / flash_time
@@ -66,7 +71,7 @@ def sweep(seq_lens, head_dims, batches):
 
 if __name__ == "__main__":
     sweep(
-        seq_lens=[128, 256, 512, 1024, 2048],
-        head_dims=[32, 64],
-        batches=[1, 4, 16],
+        seq_lens=[1024, 2048, 4096, 8192],
+        head_dims=[64, 128],
+        batches=[2, 1],
     )

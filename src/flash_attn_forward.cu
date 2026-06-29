@@ -3,7 +3,7 @@
 #include <math.h>
 
 #define TILE_SIZE 32
-#define MAX_DIM 64
+#define MAX_DIM 128
 
 __global__ void flash_attention(float *matrix_Q, float *matrix_K, float *matrix_V, float *matrix_O, int dim, int N) {
 
