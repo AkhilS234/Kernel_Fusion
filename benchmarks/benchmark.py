@@ -46,8 +46,11 @@ def sdpa_ms(Q, K, V, n_runs=20):
     return elapsed_ms, out.cpu()
 
 
-def sweep(seq_lens, head_dims, batches, num_heads_list):
-    header = f"{'N':>6} {'dim':>5} {'heads':>6} {'batch':>6} {'naive(ms)':>10} {'flash(ms)':>10} {'sdpa(ms)':>10} {'flash_speedup':>14}"
+def sweep(seq_lens, head_dims, num_heads_list, batches, run_naive=True):
+    if run_naive:
+        header = f"{'N':>6} {'dim':>5} {'heads':>6} {'batch':>6} {'naive(ms)':>10} {'flash(ms)':>10} {'sdpa(ms)':>10} {'flash_speedup':>14}"
+    else:
+        header = f"{'N':>6} {'dim':>5} {'heads':>6} {'batch':>6} {'flash(ms)':>10} {'sdpa(ms)':>10}"
     print(header)
 
     for N in seq_lens:
@@ -62,19 +65,33 @@ def sweep(seq_lens, head_dims, batches, num_heads_list):
                     K.numpy().tofile(OUTPUTS_DIR / "input_K.bin")
                     V.numpy().tofile(OUTPUTS_DIR / "input_V.bin")
 
-                    naive_time, _ = run_binary("naive_attention", N, dim, batch, num_heads, "naive_output.bin")
                     flash_time, _ = run_binary("flash_attn_forward", N, dim, batch, num_heads, "output_S.bin")
                     pytorch_time, _ = sdpa_ms(Q, K, V)
 
-                    speedup = naive_time / flash_time
-                    print(f"{N:>6} {dim:>5} {num_heads:>6} {batch:>6} {naive_time:>10.3f} {flash_time:>10.3f} "
-                          f"{pytorch_time:>10.3f} {speedup:>13.2f}x")
+                    if run_naive:
+                        naive_time, _ = run_binary("naive_attention", N, dim, batch, num_heads, "naive_output.bin")
+                        speedup = naive_time / flash_time
+                        print(f"{N:>6} {dim:>5} {num_heads:>6} {batch:>6} {naive_time:>10.3f} {flash_time:>10.3f} "
+                              f"{pytorch_time:>10.3f} {speedup:>13.2f}x")
+                    else:
+                        print(f"{N:>6} {dim:>5} {num_heads:>6} {batch:>6} {flash_time:>10.3f} {pytorch_time:>10.3f}")
 
 
 if __name__ == "__main__":
+    print("=== naive vs flash (small configs) ===")
+    sweep(
+        seq_lens=[1024, 2048],
+        head_dims=[64, 128],
+        num_heads_list=[1],
+        batches=[1],
+        run_naive=True,
+    )
+
+    print("\n=== flash vs sdpa (full range) ===")
     sweep(
         seq_lens=[1024, 2048, 4096, 8192],
         head_dims=[64, 128],
         num_heads_list=[1, 8],
         batches=[1, 2],
+        run_naive=False,
     )
