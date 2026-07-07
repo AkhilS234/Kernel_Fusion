@@ -8,13 +8,16 @@
 #define Br 64
 #define Bc 16
 
-__global__ void flash_attention(float *matrix_Q, float *matrix_K, float *matrix_V, float *matrix_O, int dim, int N) {
+__global__ void flash_attention(float *matrix_Q, float *matrix_K, float *matrix_V, float *matrix_O, int dim, int N, int num_heads) {
 
+    int head_idx  = blockIdx.x;
     int batch_idx = blockIdx.z;
-    const float *Q = matrix_Q + (size_t)batch_idx * N * dim;
-    const float *K = matrix_K + (size_t)batch_idx * N * dim;
-    const float *V = matrix_V + (size_t)batch_idx * N * dim;
-    float *matrix_O_b = matrix_O + (size_t)batch_idx * N * dim;
+    size_t head_stride  = (size_t)N * dim;
+    size_t batch_stride = (size_t)num_heads * N * dim;
+    const float *Q = matrix_Q + batch_idx * batch_stride + head_idx * head_stride;
+    const float *K = matrix_K + batch_idx * batch_stride + head_idx * head_stride;
+    const float *V = matrix_V + batch_idx * batch_stride + head_idx * head_stride;
+    float *matrix_O_b = matrix_O + batch_idx * batch_stride + head_idx * head_stride;
 
     __shared__ float tile_K[Bc][MAX_DIM + 1];
     __shared__ float tile_V[Bc][MAX_DIM + 1];
@@ -78,16 +81,17 @@ __global__ void flash_attention(float *matrix_Q, float *matrix_K, float *matrix_
 
 int main(int argc, char **argv) {
 
-    int N = argc > 1 ? atoi(argv[1]) : 1024;
-    int dim = argc > 2 ? atoi(argv[2]) : 64;
-    int batch = argc > 3 ? atoi(argv[3]) : 1;
+    int N         = argc > 1 ? atoi(argv[1]) : 1024;
+    int dim       = argc > 2 ? atoi(argv[2]) : 64;
+    int batch     = argc > 3 ? atoi(argv[3]) : 1;
+    int num_heads = argc > 4 ? atoi(argv[4]) : 1;
 
     if (dim > MAX_DIM) {
         printf("Error: dim %d exceeds MAX_DIM %d supported by this kernel\n", dim, MAX_DIM);
         return 1;
     }
 
-    size_t qkv_elems = (size_t)batch * N * dim;
+    size_t qkv_elems = (size_t)batch * num_heads * N * dim;
 
     float *host_query = new float[qkv_elems];
     float *host_key = new float[qkv_elems];
@@ -123,14 +127,14 @@ int main(int argc, char **argv) {
     cudaMemcpy(d_matrixV, host_value, qkv_elems * sizeof(float), cudaMemcpyHostToDevice);
 
     dim3 blockDim(Br);
-    dim3 gridDim(1, (N + Br - 1) / Br, batch);
+    dim3 gridDim(num_heads, (N + Br - 1) / Br, batch);
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     cudaEventRecord(start);
 
-    flash_attention<<<gridDim, blockDim>>>(d_matrixQ, d_matrixK, d_matrixV, d_matrixO, dim, N);
+    flash_attention<<<gridDim, blockDim>>>(d_matrixQ, d_matrixK, d_matrixV, d_matrixO, dim, N, num_heads);
 
     cudaGetLastError();
     cudaDeviceSynchronize();
@@ -144,7 +148,7 @@ int main(int argc, char **argv) {
 
     cudaMemcpy(host_output, d_matrixO, qkv_elems * sizeof(float), cudaMemcpyDeviceToHost);
 
-    float bytes_accessed = 4.0f * batch * N * dim * sizeof(float); // Q, K, V read once, O written once
+    float bytes_accessed = 4.0f * batch * num_heads * N * dim * sizeof(float); // Q, K, V read once, O written once
     float bandwidth_gb = (bytes_accessed / (ms / 1000.0f)) / 1e9f;
     printf("Bandwidth: %.2f GB/s\n", bandwidth_gb);
     printf("HBM accessed: %.4f GB\n", bytes_accessed / 1e9f);

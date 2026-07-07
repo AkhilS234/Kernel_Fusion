@@ -14,8 +14,8 @@ BUILD_DIR = REPO_ROOT / "build"
 OUTPUTS_DIR = REPO_ROOT / "outputs"
 
 
-def run_binary(binary_name, N, dim, batch, output_file, n_warmup=5):
-    cmd = [str(BUILD_DIR / binary_name), str(N), str(dim), str(batch)]
+def run_binary(binary_name, N, dim, batch, num_heads, output_file, n_warmup=5):
+    cmd = [str(BUILD_DIR / binary_name), str(N), str(dim), str(batch), str(num_heads)]
     for _ in range(n_warmup):
         subprocess.run(cmd, capture_output=True, cwd=str(REPO_ROOT))
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(REPO_ROOT))
@@ -23,14 +23,15 @@ def run_binary(binary_name, N, dim, batch, output_file, n_warmup=5):
     if match is None:
         raise RuntimeError(f"{binary_name} failed or printed no timing:\n{result.stdout}\n{result.stderr}")
     ms = float(match.group(1))
-    output = torch.tensor(np.fromfile(OUTPUTS_DIR / output_file, dtype=np.float32)).reshape(batch, N, dim)
+    output = torch.tensor(np.fromfile(OUTPUTS_DIR / output_file, dtype=np.float32)).reshape(batch, num_heads, N, dim)
     return ms, output
 
 
 def sdpa_ms(Q, K, V, n_runs=20):
-    Q = Q.unsqueeze(1).cuda()
-    K = K.unsqueeze(1).cuda()
-    V = V.unsqueeze(1).cuda()
+    # Q/K/V shape: [batch, num_heads, N, dim]
+    Q = Q.cuda()
+    K = K.cuda()
+    V = V.cuda()
 
     for _ in range(5):
         out = F.scaled_dot_product_attention(Q, K, V)
@@ -42,36 +43,38 @@ def sdpa_ms(Q, K, V, n_runs=20):
     torch.cuda.synchronize()
     elapsed_ms = (time.perf_counter() - start) * 1000 / n_runs
 
-    return elapsed_ms, out.squeeze(1).cpu()
+    return elapsed_ms, out.cpu()
 
 
-def sweep(seq_lens, head_dims, batches):
-    header = f"{'N':>6} {'dim':>5} {'batch':>6} {'naive(ms)':>10} {'flash(ms)':>10} {'sdpa(ms)':>10} {'flash_speedup':>14}"
+def sweep(seq_lens, head_dims, batches, num_heads_list):
+    header = f"{'N':>6} {'dim':>5} {'heads':>6} {'batch':>6} {'naive(ms)':>10} {'flash(ms)':>10} {'sdpa(ms)':>10} {'flash_speedup':>14}"
     print(header)
 
     for N in seq_lens:
         for dim in head_dims:
-            for batch in batches:
-                Q = torch.randn(batch, N, dim, dtype=torch.float32)
-                K = torch.randn(batch, N, dim, dtype=torch.float32)
-                V = torch.randn(batch, N, dim, dtype=torch.float32)
+            for num_heads in num_heads_list:
+                for batch in batches:
+                    Q = torch.randn(batch, num_heads, N, dim, dtype=torch.float32)
+                    K = torch.randn(batch, num_heads, N, dim, dtype=torch.float32)
+                    V = torch.randn(batch, num_heads, N, dim, dtype=torch.float32)
 
-                Q.numpy().tofile(OUTPUTS_DIR / "input_Q.bin")
-                K.numpy().tofile(OUTPUTS_DIR / "input_K.bin")
-                V.numpy().tofile(OUTPUTS_DIR / "input_V.bin")
+                    Q.numpy().tofile(OUTPUTS_DIR / "input_Q.bin")
+                    K.numpy().tofile(OUTPUTS_DIR / "input_K.bin")
+                    V.numpy().tofile(OUTPUTS_DIR / "input_V.bin")
 
-                naive_time, _ = run_binary("naive_attention", N, dim, batch, "naive_output.bin")
-                flash_time, _ = run_binary("flash_attn_forward", N, dim, batch, "output_S.bin")
-                pytorch_time, _ = sdpa_ms(Q, K, V)
+                    naive_time, _ = run_binary("naive_attention", N, dim, batch, num_heads, "naive_output.bin")
+                    flash_time, _ = run_binary("flash_attn_forward", N, dim, batch, num_heads, "output_S.bin")
+                    pytorch_time, _ = sdpa_ms(Q, K, V)
 
-                speedup = naive_time / flash_time
-                print(f"{N:>6} {dim:>5} {batch:>6} {naive_time:>10.3f} {flash_time:>10.3f} "
-                      f"{pytorch_time:>10.3f} {speedup:>13.2f}x")
+                    speedup = naive_time / flash_time
+                    print(f"{N:>6} {dim:>5} {num_heads:>6} {batch:>6} {naive_time:>10.3f} {flash_time:>10.3f} "
+                          f"{pytorch_time:>10.3f} {speedup:>13.2f}x")
 
 
 if __name__ == "__main__":
     sweep(
         seq_lens=[1024, 2048, 4096, 8192],
         head_dims=[64, 128],
-        batches=[1,2],
+        num_heads_list=[1, 8],
+        batches=[1, 2],
     )

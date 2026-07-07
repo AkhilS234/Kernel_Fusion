@@ -3,12 +3,15 @@
 #include <math.h>
 #include <float.h>
 
-__global__ void attention_scores(float *matrix_Q, float *matrix_K, float *matrix_S, int dim, int N) {
+__global__ void attention_scores(float *matrix_Q, float *matrix_K, float *matrix_S, int dim, int N, int num_heads) {
 
-    int batch_idx = blockIdx.z;
-    const float *Q = matrix_Q + (size_t)batch_idx * N * dim;
-    const float *K = matrix_K + (size_t)batch_idx * N * dim;
-    float *S = matrix_S + (size_t)batch_idx * N * N;
+    int batch_idx = blockIdx.z / num_heads;
+    int head_idx  = blockIdx.z % num_heads;
+    size_t qkv_offset = ((size_t)batch_idx * num_heads + head_idx) * N * dim;
+    size_t s_offset   = ((size_t)batch_idx * num_heads + head_idx) * N * N;
+    const float *Q = matrix_Q + qkv_offset;
+    const float *K = matrix_K + qkv_offset;
+    float *S = matrix_S + s_offset;
 
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     int row = blockIdx.y * blockDim.y + threadIdx.y;
@@ -24,11 +27,13 @@ __global__ void attention_scores(float *matrix_Q, float *matrix_K, float *matrix
 
 }
 
-__global__ void softmax(float *matrix_S, float *matrix_P, int N) {
+__global__ void softmax(float *matrix_S, float *matrix_P, int N, int num_heads) {
 
-    int batch_idx = blockIdx.z;
-    float *S = matrix_S + (size_t)batch_idx * N * N;
-    float *P = matrix_P + (size_t)batch_idx * N * N;
+    int batch_idx = blockIdx.z / num_heads;
+    int head_idx  = blockIdx.z % num_heads;
+    size_t s_offset = ((size_t)batch_idx * num_heads + head_idx) * N * N;
+    float *S = matrix_S + s_offset;
+    float *P = matrix_P + s_offset;
 
     int row = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -49,12 +54,15 @@ __global__ void softmax(float *matrix_S, float *matrix_P, int N) {
     }
 }
 
-__global__ void output(float *matrix_P, float *matrix_V, float *matrix_O, int dim, int N) {
+__global__ void output(float *matrix_P, float *matrix_V, float *matrix_O, int dim, int N, int num_heads) {
 
-    int batch_idx = blockIdx.z;
-    const float *P = matrix_P + (size_t)batch_idx * N * N;
-    const float *V = matrix_V + (size_t)batch_idx * N * dim;
-    float *O = matrix_O + (size_t)batch_idx * N * dim;
+    int batch_idx = blockIdx.z / num_heads;
+    int head_idx  = blockIdx.z % num_heads;
+    size_t qkv_offset = ((size_t)batch_idx * num_heads + head_idx) * N * dim;
+    size_t s_offset   = ((size_t)batch_idx * num_heads + head_idx) * N * N;
+    const float *P = matrix_P + s_offset;
+    const float *V = matrix_V + qkv_offset;
+    float *O = matrix_O + qkv_offset;
 
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -70,12 +78,13 @@ __global__ void output(float *matrix_P, float *matrix_V, float *matrix_O, int di
 
 int main(int argc, char **argv) {
 
-    int N = argc > 1 ? atoi(argv[1]) : 1024;
-    int dim = argc > 2 ? atoi(argv[2]) : 64;
-    int batch = argc > 3 ? atoi(argv[3]) : 1;
+    int N         = argc > 1 ? atoi(argv[1]) : 1024;
+    int dim       = argc > 2 ? atoi(argv[2]) : 64;
+    int batch     = argc > 3 ? atoi(argv[3]) : 1;
+    int num_heads = argc > 4 ? atoi(argv[4]) : 1;
 
-    size_t qkv_elems = (size_t)batch * N * dim;
-    size_t s_elems = (size_t)batch * N * N;
+    size_t qkv_elems = (size_t)batch * num_heads * N * dim;
+    size_t s_elems   = (size_t)batch * num_heads * N * N;
 
     float *host_query = new float[qkv_elems];
     float *host_key = new float[qkv_elems];
@@ -113,16 +122,16 @@ int main(int argc, char **argv) {
     cudaMemcpy(device_value, host_value, qkv_elems * sizeof(float), cudaMemcpyHostToDevice);
 
     dim3 blockDim(32, 32);
-    dim3 gridDim((N + 31) / 32, (N + 31) / 32, batch);
+    dim3 gridDim((N + 31) / 32, (N + 31) / 32, batch * num_heads);
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     cudaEventRecord(start);
 
-    attention_scores<<<gridDim, blockDim>>>(device_query, device_key, device_S, dim, N);
-    softmax<<<gridDim, blockDim>>>(device_S, device_P, N);
-    output<<<gridDim, blockDim>>>(device_P, device_value, device_O, dim, N);
+    attention_scores<<<gridDim, blockDim>>>(device_query, device_key, device_S, dim, N, num_heads);
+    softmax<<<gridDim, blockDim>>>(device_S, device_P, N, num_heads);
+    output<<<gridDim, blockDim>>>(device_P, device_value, device_O, dim, N, num_heads);
 
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
@@ -135,9 +144,9 @@ int main(int argc, char **argv) {
     printf("Output[0][0]: %f\n", host_output[0]);
 
     float bytes_accessed = (
-    3.0f * batch * N * dim * sizeof(float) +
-    2.0f * batch * N * N * sizeof(float) +
-    1.0f * batch * N * dim * sizeof(float)
+    3.0f * batch * num_heads * N * dim * sizeof(float) +
+    2.0f * batch * num_heads * N * N * sizeof(float) +
+    1.0f * batch * num_heads * N * dim * sizeof(float)
     );
 
     float bandwidth_gb = (bytes_accessed / (ms / 1000.0f)) / 1e9f;
