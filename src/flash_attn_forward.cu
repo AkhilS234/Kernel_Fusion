@@ -3,7 +3,7 @@
 #include <math.h>
 
 #define TILE_SIZE 32
-#define MAX_DIM 64
+#define MAX_DIM 128
 
 #define Br 64
 #define Bc 32
