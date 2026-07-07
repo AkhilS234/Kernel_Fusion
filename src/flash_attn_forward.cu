@@ -6,7 +6,7 @@
 #define MAX_DIM 128
 
 #define Br 64
-#define Bc 32
+#define Bc 16
 
 __global__ void flash_attention(float *matrix_Q, float *matrix_K, float *matrix_V, float *matrix_O, int dim, int N) {
 
@@ -16,8 +16,8 @@ __global__ void flash_attention(float *matrix_Q, float *matrix_K, float *matrix_
     const float *V = matrix_V + (size_t)batch_idx * N * dim;
     float *matrix_O_b = matrix_O + (size_t)batch_idx * N * dim;
 
-    __shared__ float tile_K[Bc][MAX_DIM];
-    __shared__ float tile_V[Bc][MAX_DIM];
+    __shared__ float tile_K[Bc][MAX_DIM + 1];
+    __shared__ float tile_V[Bc][MAX_DIM + 1];
 
     int q_row = blockIdx.y * Br + threadIdx.x;
 
@@ -35,12 +35,13 @@ __global__ void flash_attention(float *matrix_Q, float *matrix_K, float *matrix_
     float acc[MAX_DIM] = {0.0f};
 
     for (int k_tile = 0; k_tile < N; k_tile += Bc) {
-        int k_row = k_tile + threadIdx.x;
-        if (threadIdx.x < Bc && k_row < N) {
-            for (int d = 0; d < dim; d++) {
-                tile_K[threadIdx.x][d] = K[k_row * dim + d];
-                tile_V[threadIdx.x][d] = V[k_row * dim + d];
-            }
+        
+        for (int idx = threadIdx.x; idx < Bc * dim; idx += blockDim.x) {
+            int row = idx / dim;
+            int col = idx % dim;
+            int global_row = k_tile + row;
+            tile_K[row][col] = (global_row < N) ? K[global_row * dim + col] : 0.0f;
+            tile_V[row][col] = (global_row < N) ? V[global_row * dim + col] : 0.0f;
         }
         __syncthreads();
 
