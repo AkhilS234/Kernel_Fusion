@@ -14,11 +14,11 @@ BUILD_DIR = REPO_ROOT / "build"
 OUTPUTS_DIR = REPO_ROOT / "outputs"
 
 
-def run_binary(binary_name, N, dim, batch, output_file):
-    result = subprocess.run(
-        [str(BUILD_DIR / binary_name), str(N), str(dim), str(batch)],
-        capture_output=True, text=True, cwd=str(REPO_ROOT)
-    )
+def run_binary(binary_name, N, dim, batch, output_file, n_warmup=5):
+    cmd = [str(BUILD_DIR / binary_name), str(N), str(dim), str(batch)]
+    for _ in range(n_warmup):
+        subprocess.run(cmd, capture_output=True, cwd=str(REPO_ROOT))
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(REPO_ROOT))
     match = TIME_RE.search(result.stdout)
     if match is None:
         raise RuntimeError(f"{binary_name} failed or printed no timing:\n{result.stdout}\n{result.stderr}")

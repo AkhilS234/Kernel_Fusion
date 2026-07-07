@@ -3,7 +3,7 @@
 #include <math.h>
 
 #define TILE_SIZE 32
-#define MAX_DIM 128
+#define MAX_DIM 64
 
 __global__ void flash_attention(float *matrix_Q, float *matrix_K, float *matrix_V, float *matrix_O, int dim, int N) {
 
@@ -13,17 +13,19 @@ __global__ void flash_attention(float *matrix_Q, float *matrix_K, float *matrix_
     const float *V = matrix_V + (size_t)batch_idx * N * dim;
     float *matrix_O_b = matrix_O + (size_t)batch_idx * N * dim;
 
-    __shared__ float tile_Q[TILE_SIZE][MAX_DIM];
+    //__shared__ float tile_Q[TILE_SIZE][MAX_DIM];
     __shared__ float tile_K[TILE_SIZE][MAX_DIM];
     __shared__ float tile_V[TILE_SIZE][MAX_DIM];
 
-    int q_row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int q_row = blockIdx.y * Br + threadIdx.x;
 
+    float q_register[MAX_DIM];
     if (q_row < N) {
-        for (int d = threadIdx.x; d < dim; d += blockDim.x) {
-            tile_Q[threadIdx.y][d] = Q[q_row * dim + d];
+        for (int d = 0; d < dim; d++) {
+            q_register[d] = Q[q_row * dim + d];
         }
     }
+
     __syncthreads();
 
     float m_old = -INFINITY;
@@ -31,11 +33,11 @@ __global__ void flash_attention(float *matrix_Q, float *matrix_K, float *matrix_
     float acc[MAX_DIM] = {0.0f};
 
     for (int k_tile = 0; k_tile < N; k_tile += TILE_SIZE) {
-        int k_row = k_tile + threadIdx.y;
+        int k_row = k_tile + threadIdx.x;
         if (k_row < N) {
-            for (int d = threadIdx.x; d < dim; d += blockDim.x) {
-                tile_K[threadIdx.y][d] = K[k_row * dim + d];
-                tile_V[threadIdx.y][d] = V[k_row * dim + d];
+            for (int d = 0; d < dim; d++) {
+                tile_K[threadIdx.x][d] = K[k_row * dim + d];
+                tile_V[threadIdx.x][d] = V[k_row * dim + d];
             }
         }
         __syncthreads();
@@ -44,7 +46,7 @@ __global__ void flash_attention(float *matrix_Q, float *matrix_K, float *matrix_
         for (int k = 0; k < tile_rows; k++) {
             float val = 0.0f;
             for (int i = 0; i < dim; i++) {
-                val += tile_Q[threadIdx.y][i] * tile_K[k][i];
+                val += q_register[i] * tile_K[k][i];
             }
 
             val /= sqrtf((float)dim);
@@ -117,8 +119,9 @@ int main(int argc, char **argv) {
     cudaMemcpy(d_matrixK, host_key, qkv_elems * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_matrixV, host_value, qkv_elems * sizeof(float), cudaMemcpyHostToDevice);
 
-    dim3 blockDim(TILE_SIZE, TILE_SIZE);
-    dim3 gridDim(1, (N + TILE_SIZE - 1) / TILE_SIZE, batch);
+    float Br = 64;
+    dim3 blockDim(Br);
+    dim3 gridDim(1, (N + Br - 1) / Br, batch);
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -126,6 +129,9 @@ int main(int argc, char **argv) {
     cudaEventRecord(start);
 
     flash_attention<<<gridDim, blockDim>>>(d_matrixQ, d_matrixK, d_matrixV, d_matrixO, dim, N);
+
+    cudaGetLastError();
+    cudaDeviceSynchronize();
 
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
