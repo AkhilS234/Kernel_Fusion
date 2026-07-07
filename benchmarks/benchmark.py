@@ -73,5 +73,5 @@ if __name__ == "__main__":
     sweep(
         seq_lens=[1024, 2048, 4096, 8192],
         head_dims=[64, 128],
-        batches=[2, 1],
+        batches=[1,2],
     )
