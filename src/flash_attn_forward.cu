@@ -5,7 +5,7 @@
 #define TILE_SIZE 32
 #define MAX_DIM 64
 
-__global__ void flash_attention(float *matrix_Q, float *matrix_K, float *matrix_V, float *matrix_O, int dim, int N) {
+__global__ void flash_attention(float *matrix_Q, float *matrix_K, float *matrix_V, float *matrix_O, int dim, int Br, int N) {
 
     int batch_idx = blockIdx.z;
     const float *Q = matrix_Q + (size_t)batch_idx * N * dim;
@@ -119,7 +119,7 @@ int main(int argc, char **argv) {
     cudaMemcpy(d_matrixK, host_key, qkv_elems * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_matrixV, host_value, qkv_elems * sizeof(float), cudaMemcpyHostToDevice);
 
-    float Br = 64;
+    const int Br = 64;
     dim3 blockDim(Br);
     dim3 gridDim(1, (N + Br - 1) / Br, batch);
 
@@ -128,7 +128,7 @@ int main(int argc, char **argv) {
     cudaEventCreate(&stop);
     cudaEventRecord(start);
 
-    flash_attention<<<gridDim, blockDim>>>(d_matrixQ, d_matrixK, d_matrixV, d_matrixO, dim, N);
+    flash_attention<<<gridDim, blockDim>>>(d_matrixQ, d_matrixK, d_matrixV, d_matrixO, dim, Br, N);
 
     cudaGetLastError();
     cudaDeviceSynchronize();
