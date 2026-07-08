@@ -46,11 +46,11 @@ def sdpa_ms(Q, K, V, n_runs=20):
     return elapsed_ms, out.cpu()
 
 
-def sweep(seq_lens, head_dims, num_heads_list, batches, run_naive=True):
+def sweep(seq_lens, head_dims, num_heads_list, batches, run_naive=True, naive_n_warmup=5):
     if run_naive:
-        header = f"{'N':>6} {'dim':>5} {'heads':>6} {'batch':>6} {'naive(ms)':>10} {'flash(ms)':>10} {'sdpa(ms)':>10} {'flash_speedup':>14}"
+        header = f"{'N':>6} {'dim':>5} {'heads':>6} {'batch':>6} {'naive(ms)':>10} {'flash(ms)':>10} {'sdpa(ms)':>10} {'naive/flash':>12} {'flash/sdpa':>11}"
     else:
-        header = f"{'N':>6} {'dim':>5} {'heads':>6} {'batch':>6} {'flash(ms)':>10} {'sdpa(ms)':>10}"
+        header = f"{'N':>6} {'dim':>5} {'heads':>6} {'batch':>6} {'flash(ms)':>10} {'sdpa(ms)':>10} {'flash/sdpa':>11}"
     print(header)
 
     for N in seq_lens:
@@ -67,18 +67,33 @@ def sweep(seq_lens, head_dims, num_heads_list, batches, run_naive=True):
 
                     flash_time, _ = run_binary("flash_attn_forward", N, dim, batch, num_heads, "output_S.bin")
                     pytorch_time, _ = sdpa_ms(Q, K, V)
+                    flash_vs_sdpa = flash_time / pytorch_time
 
                     if run_naive:
-                        naive_time, _ = run_binary("naive_attention", N, dim, batch, num_heads, "naive_output.bin")
-                        speedup = naive_time / flash_time
+                        naive_time, _ = run_binary("naive_attention", N, dim, batch, num_heads, "naive_output.bin",
+                                                   n_warmup=naive_n_warmup)
+                        naive_vs_flash = naive_time / flash_time
                         print(f"{N:>6} {dim:>5} {num_heads:>6} {batch:>6} {naive_time:>10.3f} {flash_time:>10.3f} "
-                              f"{pytorch_time:>10.3f} {speedup:>13.2f}x")
+                              f"{pytorch_time:>10.3f} {naive_vs_flash:>11.2f}x {flash_vs_sdpa:>10.2f}x")
                     else:
-                        print(f"{N:>6} {dim:>5} {num_heads:>6} {batch:>6} {flash_time:>10.3f} {pytorch_time:>10.3f}")
+                        print(f"{N:>6} {dim:>5} {num_heads:>6} {batch:>6} {flash_time:>10.3f} "
+                              f"{pytorch_time:>10.3f} {flash_vs_sdpa:>10.2f}x")
 
 
 if __name__ == "__main__":
-    print("=== naive vs flash (small configs) ===")
+    # single showcase row: naive + flash + sdpa at the same config for a credible apples-to-apples claim
+    # naive is O(N²) so cap N at 2048 to keep warmup reasonable (~1 warmup run)
+    print("=== showcase: naive vs flash vs sdpa ===")
+    sweep(
+        seq_lens=[2048],
+        head_dims=[128],
+        num_heads_list=[8],
+        batches=[2],
+        run_naive=True,
+        naive_n_warmup=1,
+    )
+
+    print("\n=== naive vs flash (scaling sweep, single head) ===")
     sweep(
         seq_lens=[1024, 2048],
         head_dims=[64, 128],

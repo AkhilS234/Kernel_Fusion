@@ -8,6 +8,8 @@
 #define Br 64
 #define Bc 16
 
+template <int DIM>
+
 __global__ void flash_attention(float *matrix_Q, float *matrix_K, float *matrix_V, float *matrix_O, int dim, int N, int num_heads) {
 
     int head_idx  = blockIdx.x;
@@ -19,14 +21,15 @@ __global__ void flash_attention(float *matrix_Q, float *matrix_K, float *matrix_
     const float *V = matrix_V + batch_idx * batch_stride + head_idx * head_stride;
     float *matrix_O_b = matrix_O + batch_idx * batch_stride + head_idx * head_stride;
 
-    __shared__ float tile_K[Bc][MAX_DIM + 1];
-    __shared__ float tile_V[Bc][MAX_DIM + 1];
+    extern __shared__ float smem[];
+    float *tile_K = smem;
+    float *tile_V = smem + Bc * dim;
 
     int q_row = blockIdx.y * Br + threadIdx.x;
 
-    float q_register[MAX_DIM];
+    float q_register[DIM];
     if (q_row < N) {
-        for (int d = 0; d < dim; d++) {
+        for (int d = 0; d < DIM; d++) {
             q_register[d] = Q[q_row * dim + d];
         }
     }
@@ -35,7 +38,7 @@ __global__ void flash_attention(float *matrix_Q, float *matrix_K, float *matrix_
 
     float m_old = -INFINITY;
     float l_old = 0.0f;
-    float acc[MAX_DIM] = {0.0f};
+    float acc[DIM] = {0.0f};
 
     for (int k_tile = 0; k_tile < N; k_tile += Bc) {
         
@@ -43,26 +46,26 @@ __global__ void flash_attention(float *matrix_Q, float *matrix_K, float *matrix_
             int row = idx / dim;
             int col = idx % dim;
             int global_row = k_tile + row;
-            tile_K[row][col] = (global_row < N) ? K[global_row * dim + col] : 0.0f;
-            tile_V[row][col] = (global_row < N) ? V[global_row * dim + col] : 0.0f;
+            tile_K[row * dim + col] = (global_row < N) ? K[global_row * dim + col] : 0.0f;
+            tile_V[row * dim + col] = (global_row < N) ? V[global_row * dim + col] : 0.0f;
         }
         __syncthreads();
 
         int tile_rows = min(Bc, N - k_tile);
         for (int k = 0; k < tile_rows; k++) {
             float val = 0.0f;
-            for (int i = 0; i < dim; i++) {
-                val += q_register[i] * tile_K[k][i];
+            for (int i = 0; i < DIM; i++) {
+                val += q_register[i] * tile_K[k * DIM + i];
             }
 
-            val /= sqrtf((float)dim);
+            val /= sqrtf((float)DIM);
 
             float m_new = max(m_old, val);
             float l_new = expf(m_old - m_new) * l_old + expf(val - m_new);
             float p = expf(val - m_new);
 
-            for (int d = 0; d < dim; d++) {
-                acc[d] = acc[d] * expf(m_old - m_new) + p * tile_V[k][d];
+            for (int d = 0; d < DIM; d++) {
+                acc[d] = acc[d] * expf(m_old - m_new) + p * tile_V[k * DIM + d];
             }
 
             m_old = m_new;
@@ -73,8 +76,8 @@ __global__ void flash_attention(float *matrix_Q, float *matrix_K, float *matrix_
     }
 
     if (q_row < N) {
-        for (int d = 0; d < dim; d++) {
-            matrix_O_b[q_row * dim + d] = acc[d] / l_old;
+        for (int d = 0; d < DIM; d++) {
+            matrix_O_b[q_row * DIM + d] = acc[d] / l_old;
         }
     }
 }
@@ -134,7 +137,10 @@ int main(int argc, char **argv) {
     cudaEventCreate(&stop);
     cudaEventRecord(start);
 
-    flash_attention<<<gridDim, blockDim>>>(d_matrixQ, d_matrixK, d_matrixV, d_matrixO, dim, N, num_heads);
+    size_t smem_bytes = 2 * Bc * dim * sizeof(float);
+
+    if (dim == 64) flash_attention<64><<<gridDim, blockDim, smem_bytes>>>(d_matrixQ, d_matrixK, d_matrixV, d_matrixO, dim, N, num_heads);
+    if (dim == 128) flash_attention<128><<<gridDim, blockDim, smem_bytes>>>(d_matrixQ, d_matrixK, d_matrixV, d_matrixO, dim, N, num_heads);
 
     cudaGetLastError();
     cudaDeviceSynchronize();
