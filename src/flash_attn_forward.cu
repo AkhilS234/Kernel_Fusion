@@ -108,9 +108,9 @@ int main(int argc, char **argv) {
         printf("Error: could not open input files in outputs/\n");
         return 1;
     }
-    fread(host_query, sizeof(float), qkv_elems, fq);
-    fread(host_key, sizeof(float), qkv_elems, fk);
-    fread(host_value, sizeof(float), qkv_elems, fv);
+    freed(host_query, sizeof(float), qkv_elems, fq);
+    freed(host_key, sizeof(float), qkv_elems, fk);
+    freed(host_value, sizeof(float), qkv_elems, fv);
     fclose(fq);
     fclose(fk);
     fclose(fv);
