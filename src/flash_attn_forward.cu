@@ -61,7 +61,7 @@ __global__ void flash_attention(
     extern __shared__ char smem_raw[];
     __half *smem_Q = (__half *)smem_raw;
     __half *smem_K = smem_Q + Br * DIM;
-    __half *smem_V = smem_K + Bc * DIM;
+    __half *smem_V = smem_K + Bc * (DIM + 8);  // +8 pad per row to avoid bank conflicts
     float  *smem_S = (float *)(smem_V + Bc * DIM);   // float-aligned: offset=(Br+2Bc)*DIM*2
     __half *smem_P = (__half *)(smem_S + Br * Bc);
     float  *smem_O = (float *)(smem_P + Br * Bc);
@@ -89,11 +89,16 @@ __global__ void flash_attention(
     // Outer loop: stream K/V tiles through shared memory
     for (int k_tile = 0; k_tile < N; k_tile += Bc) {
 
-        // Load K and V tiles [Bc x DIM]
+        // Load K tile [Bc x DIM] with padded row stride (DIM+8) to avoid bank conflicts
         for (int idx = tx; idx < Bc * DIM; idx += blockDim.x) {
             int row = idx / DIM, col = idx % DIM;
             int g_row = k_tile + row;
-            smem_K[idx] = (g_row < N) ? K[g_row * DIM + col] : __float2half(0.0f);
+            smem_K[row * (DIM + 8) + col] = (g_row < N) ? K[g_row * DIM + col] : __float2half(0.0f);
+        }
+        // Load V tile [Bc x DIM] (unpadded)
+        for (int idx = tx; idx < Bc * DIM; idx += blockDim.x) {
+            int row = idx / DIM, col = idx % DIM;
+            int g_row = k_tile + row;
             smem_V[idx] = (g_row < N) ? V[g_row * DIM + col] : __float2half(0.0f);
         }
         __syncthreads();
@@ -107,8 +112,8 @@ __global__ void flash_attention(
             wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, wmma::col_major> K_frag;
             // Q columns k..k+15, row-stride=DIM
             wmma::load_matrix_sync(Q_frag, smem_Q + k, DIM);
-            // K col_major + stride=DIM: element (r,c) = smem_K[k + c*DIM + r] = K[c][k+r] = K^T[r][c]
-            wmma::load_matrix_sync(K_frag, smem_K + k, DIM);
+            // K col_major + stride=DIM+8: element (r,c) = smem_K[k + c*(DIM+8) + r] = K[c][k+r] = K^T[r][c]
+            wmma::load_matrix_sync(K_frag, smem_K + k, DIM + 8);
             wmma::mma_sync(S_frag, Q_frag, K_frag, S_frag);
         }
 
@@ -230,7 +235,9 @@ int main(int argc, char **argv) {
     cudaMemcpy(d_matrixV, host_value_fp16, qkv_elems * sizeof(__half), cudaMemcpyHostToDevice);
 
     // smem: Q+K+V (fp16) + S+P (float+fp16) + O accumulator (float) + m+l (float)
-    size_t smem_bytes = (size_t)(Br + 2*Bc) * dim * sizeof(__half)
+    size_t smem_bytes = (size_t)Br * dim * sizeof(__half)
+                      + (size_t)Bc * (dim+8) * sizeof(__half)
+                      + (size_t)Bc * dim * sizeof(__half)
                       + (size_t)Br * Bc * (sizeof(float) + sizeof(__half))
                       + (size_t)Br * dim * sizeof(float)
                       + (size_t)Br * 2 * sizeof(float);
