@@ -10,16 +10,18 @@ using namespace nvcuda;
 #define WMMA_M   16
 #define WMMA_N   16
 #define WMMA_K   16
-#define NWARPS   4                 // warps per block, each owns a WMMA_M row-group
-#define Br       (NWARPS * WMMA_M) // Q rows per block = 64
 #define Bc       16                // K/V rows per tile = one WMMA N tile
 #define PAD      8                 // element padding on every 2D smem row to dodge bank conflicts
 #define MAX_DIM  128
 #define FULL_MASK 0xffffffffu
 
 /*
- * NWARPS warps (128 threads) per block. Each warp owns a private WMMA_M=16
- * row-group of Q, so the block covers Br = NWARPS*16 = 64 consecutive rows.
+ * NWARPS warps (NWARPS*32 threads) per block. Each warp owns a private
+ * WMMA_M=16 row-group of Q, so the block covers Br = NWARPS*16 rows.
+ * NWARPS is a template parameter (not a fixed constant) because shared
+ * memory scales with Br*(dim+PAD); at dim=128, NWARPS=4 (Br=64) overflows
+ * the 64KB opt-in limit on cc7.5 (T4), so callers must pick a smaller
+ * NWARPS there — see the host dispatch in main().
  *
  * S [16 x Bc] = Q_warp [16 x DIM] * K^T [DIM x Bc]   via WMMA (Tensor Cores)
  * O [16 x DIM] += P [16 x Bc] * V [Bc x DIM]         via WMMA
@@ -35,7 +37,7 @@ using namespace nvcuda;
  * pattern that left half of every warp idle.
  */
 
-template <int DIM>
+template <int DIM, int NWARPS>
 __global__ void flash_attention(
     const __half *matrix_Q,
     const __half *matrix_K,
@@ -43,6 +45,7 @@ __global__ void flash_attention(
     float        *matrix_O,
     int N, int num_heads)
 {
+    constexpr int Br  = NWARPS * WMMA_M;
     constexpr int QLD = DIM + PAD;
     constexpr int KLD = DIM + PAD;
     constexpr int VLD = DIM + PAD;
@@ -207,6 +210,49 @@ __global__ void flash_attention(
     }
 }
 
+// Computes smem size for (DIM, NWARPS), sets the dynamic-smem opt-in, launches,
+// and checks every CUDA call so a budget overrun fails loud instead of silently
+// (a >64KB request on cc7.5 makes cudaFuncSetAttribute fail, which used to leave
+// the kernel launch silently skipped and matrix_O full of uninitialized memory).
+template <int DIM, int NWARPS>
+bool launch_flash_attention(const __half *dQ, const __half *dK, const __half *dV,
+                             float *dO, int N, int num_heads, int batch)
+{
+    constexpr int Br = NWARPS * WMMA_M;
+    size_t smem_bytes = (size_t)Br * (DIM + PAD) * sizeof(__half)              // Q
+                      + (size_t)Bc * (DIM + PAD) * sizeof(__half)              // K
+                      + (size_t)Bc * (DIM + PAD) * sizeof(__half)              // V
+                      + (size_t)NWARPS * WMMA_M * (Bc + PAD) * sizeof(float)   // S
+                      + (size_t)NWARPS * WMMA_M * (Bc + PAD) * sizeof(__half)  // P
+                      + (size_t)Br * (DIM + PAD) * sizeof(float)               // O
+                      + (size_t)Br * 2 * sizeof(float);                        // m, l
+
+    dim3 blockDim(NWARPS * 32);
+    dim3 gridDim(num_heads, (N + Br - 1) / Br, batch);
+
+    cudaError_t err = cudaFuncSetAttribute(flash_attention<DIM, NWARPS>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
+    if (err != cudaSuccess) {
+        printf("cudaFuncSetAttribute failed: %s (requested %zu bytes, DIM=%d NWARPS=%d)\n",
+               cudaGetErrorString(err), smem_bytes, DIM, NWARPS);
+        return false;
+    }
+
+    flash_attention<DIM, NWARPS><<<gridDim, blockDim, smem_bytes>>>(dQ, dK, dV, dO, N, num_heads);
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("kernel launch failed: %s\n", cudaGetErrorString(err));
+        return false;
+    }
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        printf("kernel execution failed: %s\n", cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
 int main(int argc, char **argv) {
 
     int N         = argc > 1 ? atoi(argv[1]) : 1024;
@@ -263,38 +309,27 @@ int main(int argc, char **argv) {
     cudaMemcpy(d_matrixK, host_key_fp16,   qkv_elems * sizeof(__half), cudaMemcpyHostToDevice);
     cudaMemcpy(d_matrixV, host_value_fp16, qkv_elems * sizeof(__half), cudaMemcpyHostToDevice);
 
-    // smem: Q+K+V (fp16, padded rows) + S+P (float+fp16, per-warp, padded) +
-    //       O accumulator (float, padded) + m+l (float)
-    size_t smem_bytes = (size_t)Br * (dim + PAD) * sizeof(__half)   // Q
-                      + (size_t)Bc * (dim + PAD) * sizeof(__half)   // K
-                      + (size_t)Bc * (dim + PAD) * sizeof(__half)   // V
-                      + (size_t)NWARPS * WMMA_M * (Bc + PAD) * sizeof(float)   // S
-                      + (size_t)NWARPS * WMMA_M * (Bc + PAD) * sizeof(__half)  // P
-                      + (size_t)Br * (dim + PAD) * sizeof(float)    // O
-                      + (size_t)Br * 2 * sizeof(float);             // m, l
-
-    dim3 blockDim(NWARPS * 32);   // NWARPS warps per block
-    dim3 gridDim(num_heads, (N + Br - 1) / Br, batch);
-
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     cudaEventRecord(start);
 
+    // NWARPS=4 (Br=64) at dim=64 fits well under the 64KB cc7.5 opt-in limit.
+    // At dim=128 the same NWARPS would need ~69KB, so drop to NWARPS=2 (Br=32),
+    // which lands at ~41KB — comfortably in budget.
+    bool ok;
     if (dim == 64) {
-        cudaFuncSetAttribute(flash_attention<64>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
-        flash_attention<64><<<gridDim, blockDim, smem_bytes>>>(
-            d_matrixQ, d_matrixK, d_matrixV, d_matrixO, N, num_heads);
+        ok = launch_flash_attention<64, 4>(d_matrixQ, d_matrixK, d_matrixV, d_matrixO, N, num_heads, batch);
     } else if (dim == 128) {
-        cudaFuncSetAttribute(flash_attention<128>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
-        flash_attention<128><<<gridDim, blockDim, smem_bytes>>>(
-            d_matrixQ, d_matrixK, d_matrixV, d_matrixO, N, num_heads);
+        ok = launch_flash_attention<128, 2>(d_matrixQ, d_matrixK, d_matrixV, d_matrixO, N, num_heads, batch);
+    } else {
+        printf("Error: unsupported dim %d\n", dim);
+        return 1;
     }
-
-    cudaGetLastError();
-    cudaDeviceSynchronize();
+    if (!ok) {
+        cudaFree(d_matrixQ); cudaFree(d_matrixK); cudaFree(d_matrixV); cudaFree(d_matrixO);
+        return 1;
+    }
 
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
