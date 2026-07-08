@@ -5,8 +5,8 @@
 #define TILE_SIZE 32
 #define MAX_DIM 128
 
-#define Br 64
-#define Bc 16
+#define Br 32
+#define Bc 8
 
 template <int DIM>
 
