@@ -56,7 +56,4 @@ int main() {
     cudaFree(device_output);
     return 0;
 
-}
-
-// Online Softmax implements softmax with a running statistic (m,l) without ever needing to see the full row at once
-// This exists to isolate and verify the correctness of online softmax before implementing in flash attention 
+} 

@@ -28,7 +28,6 @@ def run_binary(binary_name, N, dim, batch, num_heads, output_file, n_warmup=5):
 
 
 def sdpa_ms(Q, K, V, n_runs=20):
-    # Q/K/V shape: [batch, num_heads, N, dim]
     Q = Q.cuda()
     K = K.cuda()
     V = V.cuda()
@@ -81,8 +80,6 @@ def sweep(seq_lens, head_dims, num_heads_list, batches, run_naive=True, naive_n_
 
 
 if __name__ == "__main__":
-    # single showcase row: naive + flash + sdpa at the same config for a credible apples-to-apples claim
-    # naive is O(N²) so cap N at 2048 to keep warmup reasonable (~1 warmup run)
     print("=== showcase: naive vs flash vs sdpa ===")
     sweep(
         seq_lens=[2048],
