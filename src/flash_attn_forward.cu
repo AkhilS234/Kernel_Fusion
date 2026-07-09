@@ -10,7 +10,7 @@ using namespace nvcuda;
 #define WMMA_M   16
 #define WMMA_N   16
 #define WMMA_K   16
-#define Bc       16                // K/V rows per tile = one WMMA N tile
+#define Bc       16                
 #define MAX_DIM  128
 #define FULL_MASK 0xffffffffu
 
@@ -25,19 +25,8 @@ using namespace nvcuda;
 // for the float S/O buffers too, landing on gcd=8 instead of the achievable 4
 // (e.g. 64+8=72, 72/4=18 even -> gcd=8). +4 fixes it: 64+4=68, 68/4=17 odd ->
 // gcd=4; 128+4=132, 132/4=33 odd -> gcd=4; Bc+4=20, 20/4=5 odd -> gcd=4.
-#define PAD_H    8   // __half buffers (K, V, P): ldm multiple of 8, already optimal
+#define PAD_H    8   // __half buffers (Q, K, V, P): ldm multiple of 8, already optimal
 #define PAD_F    4   // float buffers (S, O): ldm multiple of 4, was wrongly reusing PAD_H
-
-// Q is no longer staged through shared memory at all — each warp loads its own
-// Q fragments directly from global memory once per row-tile and keeps them in
-// registers across the whole k_tile loop (Q doesn't change within a tile, so
-// the old code was redundantly reloading the same fragment from smem every
-// k_tile iteration). To make that safe without a smem scratch buffer or a
-// boundary branch, the host allocates Q with Q_PAD_ROWS extra zeroed rows at
-// the end of every (batch, head)'s slice, so a warp's 16-row fragment load is
-// always in-bounds even for the last, partially-valid row-tile. Must be >=
-// the largest Br (= NWARPS*WMMA_M) ever dispatched; NWARPS=2 -> Br=32 today.
-#define Q_PAD_ROWS 64
 
 /*
  * NWARPS warps (NWARPS*32 threads) per block. Each warp owns a private
@@ -80,27 +69,25 @@ __global__ void flash_attention(
     int N, int num_heads)
 {
     constexpr int Br  = NWARPS * WMMA_M;
+    constexpr int QLD = DIM + PAD_H;
     constexpr int KLD = DIM + PAD_H;
     constexpr int VLD = DIM + PAD_H;
     constexpr int OLD = DIM + PAD_F;
     constexpr int SLD = Bc + PAD_F;
     constexpr int PLD = Bc + PAD_H;
-    constexpr int NUM_Q_FRAGS = DIM / WMMA_K;
 
     int head_idx  = blockIdx.x;
     int batch_idx = blockIdx.z;
-    size_t head_stride   = (size_t)N * DIM;
-    size_t batch_stride  = (size_t)num_heads * N * DIM;
-    size_t q_head_stride  = (size_t)(N + Q_PAD_ROWS) * DIM;   // Q has its own, padded stride
-    size_t q_batch_stride = (size_t)num_heads * q_head_stride;
+    size_t head_stride  = (size_t)N * DIM;
+    size_t batch_stride = (size_t)num_heads * N * DIM;
 
-    const __half *Q  = matrix_Q + batch_idx * q_batch_stride + head_idx * q_head_stride;
+    const __half *Q  = matrix_Q + batch_idx * batch_stride + head_idx * head_stride;
     const __half *K  = matrix_K + batch_idx * batch_stride + head_idx * head_stride;
     const __half *V  = matrix_V + batch_idx * batch_stride + head_idx * head_stride;
     float        *Og = matrix_O + batch_idx * batch_stride + head_idx * head_stride;
 
-    // Shared memory layout (byte-addressed, manually partitioned) — Q is not
-    // staged here at all, see NUM_Q_FRAGS / Q_frags below:
+    // Shared memory layout (byte-addressed, manually partitioned):
+    //   smem_Q [Br x QLD]            __half   Q tile, loaded once per block
     //   smem_K [Bc x KLD]            __half   K tile, refreshed each outer iteration (block-shared)
     //   smem_V [Bc x VLD]            __half   V tile, refreshed each outer iteration (block-shared)
     //   smem_S [NWARPS x 16 x SLD]   float    raw scores / P weights, private per warp
@@ -108,7 +95,8 @@ __global__ void flash_attention(
     //   smem_O [Br x OLD]            float    running output accumulator
     //   smem_m [Br], smem_l [Br]     float    running per-row softmax stats
     extern __shared__ char smem_raw[];
-    __half *smem_K = (__half *)smem_raw;
+    __half *smem_Q = (__half *)smem_raw;
+    __half *smem_K = smem_Q + Br * QLD;
     __half *smem_V = smem_K + Bc * KLD;
     float  *smem_S = (float *)(smem_V + Bc * VLD);
     __half *smem_P = (__half *)(smem_S + NWARPS * WMMA_M * SLD);
@@ -136,14 +124,12 @@ __global__ void flash_attention(
     for (int q_row_base = blockIdx.y * Br; q_row_base < N; q_row_base += gridDim.y * Br) {
         __syncthreads();
 
-        // Load this warp's Q fragments directly from global memory, once per
-        // tile, kept resident in registers for every k_tile iteration below.
-        // Safe even for the last (partial) tile because Q's host-side buffer
-        // has Q_PAD_ROWS extra zeroed rows past N — see Q_PAD_ROWS above.
-        wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> Q_frags[NUM_Q_FRAGS];
-        for (int i = 0; i < NUM_Q_FRAGS; i++)
-            wmma::load_matrix_sync(Q_frags[i], Q + (q_row_base + warp_row_base) * DIM + i * WMMA_K, DIM);
-
+        // Load Q tile [Br x DIM] into padded smem, cooperatively across the whole block
+        for (int idx = tx; idx < Br * DIM; idx += blockDim.x) {
+            int row = idx / DIM, col = idx % DIM;
+            int g_row = q_row_base + row;
+            smem_Q[row * QLD + col] = (g_row < N) ? Q[g_row * DIM + col] : __float2half(0.0f);
+        }
         // Init output accumulator and running softmax stats
         for (int idx = tx; idx < Br * DIM; idx += blockDim.x) {
             int row = idx / DIM, col = idx % DIM;
@@ -174,9 +160,11 @@ __global__ void flash_attention(
             wmma::fill_fragment(S_frag, 0.0f);
 
             for (int k = 0; k < DIM; k += WMMA_K) {
+                wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> Q_frag;
                 wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, wmma::col_major> K_frag;
+                wmma::load_matrix_sync(Q_frag, smem_Q + warp_row_base * QLD + k, QLD);
                 wmma::load_matrix_sync(K_frag, smem_K + k, KLD);
-                wmma::mma_sync(S_frag, Q_frags[k / WMMA_K], K_frag, S_frag);
+                wmma::mma_sync(S_frag, Q_frag, K_frag, S_frag);
             }
 
             // Store S fragment to this warp's private smem [16 x Bc] row-major
@@ -258,8 +246,8 @@ bool launch_flash_attention(const __half *dQ, const __half *dK, const __half *dV
                              float *dO, int N, int num_heads, int batch)
 {
     constexpr int Br = NWARPS * WMMA_M;
-    // No Q term: Q is loaded straight from global memory into registers, not staged in smem.
-    size_t smem_bytes = (size_t)Bc * (DIM + PAD_H) * sizeof(__half)              // K
+    size_t smem_bytes = (size_t)Br * (DIM + PAD_H) * sizeof(__half)              // Q
+                      + (size_t)Bc * (DIM + PAD_H) * sizeof(__half)              // K
                       + (size_t)Bc * (DIM + PAD_H) * sizeof(__half)              // V
                       + (size_t)NWARPS * WMMA_M * (Bc + PAD_F) * sizeof(float)   // S
                       + (size_t)NWARPS * WMMA_M * (Bc + PAD_H) * sizeof(__half)  // P
@@ -352,28 +340,12 @@ int main(int argc, char **argv) {
 
     __half *d_matrixQ, *d_matrixK, *d_matrixV;
     float  *d_matrixO;
-
-    // Q gets Q_PAD_ROWS extra zeroed rows per (batch, head) slice so the kernel
-    // can load Q fragments straight from global memory without a smem scratch
-    // buffer or a boundary branch (see the Q_PAD_ROWS comment at the top of
-    // the file). K/V/O keep their original, unpadded layout.
-    size_t q_head_elems  = (size_t)(N + Q_PAD_ROWS) * dim;
-    size_t q_total_elems = (size_t)batch * num_heads * q_head_elems;
-
-    cudaMalloc(&d_matrixQ, q_total_elems * sizeof(__half));
+    cudaMalloc(&d_matrixQ, qkv_elems * sizeof(__half));
     cudaMalloc(&d_matrixK, qkv_elems * sizeof(__half));
     cudaMalloc(&d_matrixV, qkv_elems * sizeof(__half));
     cudaMalloc(&d_matrixO, qkv_elems * sizeof(float));
 
-    cudaMemset(d_matrixQ, 0, q_total_elems * sizeof(__half));
-    for (int b = 0; b < batch; b++) {
-        for (int h = 0; h < num_heads; h++) {
-            size_t src_offset = ((size_t)b * num_heads + h) * N * dim;
-            size_t dst_offset = ((size_t)b * num_heads + h) * q_head_elems;
-            cudaMemcpy(d_matrixQ + dst_offset, host_query_fp16 + src_offset,
-                       (size_t)N * dim * sizeof(__half), cudaMemcpyHostToDevice);
-        }
-    }
+    cudaMemcpy(d_matrixQ, host_query_fp16, qkv_elems * sizeof(__half), cudaMemcpyHostToDevice);
     cudaMemcpy(d_matrixK, host_key_fp16,   qkv_elems * sizeof(__half), cudaMemcpyHostToDevice);
     cudaMemcpy(d_matrixV, host_value_fp16, qkv_elems * sizeof(__half), cudaMemcpyHostToDevice);
 
@@ -382,11 +354,14 @@ int main(int argc, char **argv) {
     cudaEventCreate(&stop);
     cudaEventRecord(start);
 
-    // NWARPS=2 (Br=32) uniformly. With Q dropped from shared memory entirely
-    // (loaded straight into registers instead), dim=64 lands at ~17KB and
-    // dim=128 at ~29KB per block — both now clear the 32KB/block line needed
-    // for 2+ resident blocks/SM on a 64KB-per-SM part (dim=64 gets ~3,
-    // dim=128 gets ~2), where dim=128 previously got only 1 with Q staged.
+    // NWARPS=2 (Br=32) uniformly: with the corrected float padding (PAD_F=4),
+    // dim=64 lands at ~22KB and dim=128 at ~38KB per block — both well clear
+    // of the 64KB cc7.5 opt-in cap. dim=64 comfortably supports 2+ resident
+    // blocks/SM; dim=128 still fits only 1 block/SM (38KB > 32KB), since
+    // going further would mean shrinking Bc below WMMA_N=16, which needs
+    // masking logic for the resulting partial K/V tile that isn't in place
+    // here (see the file-level comment on the pre-existing boundary-padding
+    // behavior this would interact with).
     bool ok;
     if (dim == 64) {
         ok = launch_flash_attention<64, 2>(d_matrixQ, d_matrixK, d_matrixV, d_matrixO, N, num_heads, batch);
@@ -413,7 +388,7 @@ int main(int argc, char **argv) {
     float bytes_accessed = 3.0f * qkv_elems * sizeof(__half)  // Q, K, V (FP16)
                          + 1.0f * qkv_elems * sizeof(float);  // O       (FP32)
     float bandwidth_gb = (bytes_accessed / (ms / 1000.0f)) / 1e9f;
-    printf("Bandwidth: %.2f GB/s\n", bandwidth_gb); 
+    printf("Bandwidth: %.2f GB/s\n", bandwidth_gb);
     printf("HBM accessed: %.4f GB\n", bytes_accessed / 1e9f);
 
     FILE *fo = fopen("outputs/output_S.bin", "wb");
