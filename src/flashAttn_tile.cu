@@ -60,78 +60,48 @@ __tile_global__ void fused_attn_tile(const __half* A, const __half* B, const __h
 
     auto O = ct::zeros<ct::tile<float, ct::shape< TILE_M, TILE_K>>>();
 
-    auto global_max = ct::zeros<ct::tile<float, ct::shape<TILE_M>>>();
+    auto global_max = ct::zeros<ct::tile<float, ct::shape<TILE_M>>>() - INFINITY;
     auto global_sum = ct::zeros<ct::tile<float, ct::shape<TILE_M>>>();
-
-    auto max_old = ct::zeros<ct::tile<float, ct::shape<TILE_M>>>();
-    auto max_new = ct::zeros<ct::tile<float, ct::shape<TILE_M>>>();
 
 
     for (int i = 0; i < total_kv_blocks; i++) {
 
         auto S = ct::zeros<ct::tile<float, ct::shape<TILE_M, TILE_N>>>();
-        auto P = ct::zeros<ct::tile<float, ct::shape<TILE_M, TILE_N>>>();
 
-            for (int k_block = 0; k_block < total_k_blocks; k_block++) {
+        for (int k_block = 0; k_block < total_k_blocks; k_block++) {
 
-                ct::tile<__half, ct::shape<TILE_M, TILE_K>>a_tile;
-                ct::tile<__half, ct::shape<TILE_K, TILE_N>>b_tile;
+            ct::tile<__half, ct::shape<TILE_M, TILE_K>>a_tile;
+            ct::tile<__half, ct::shape<TILE_K, TILE_N>>b_tile;
 
-                // Load_masked ensures that it fills in zero if reading past the array's true bounds 
+            // Load_masked ensures that it fills in zero if reading past the array's true bounds
 
-                a_tile = aView.load_masked(pid_m, k_block);
-                b_tile = bView.load_masked(k_block, i);
+            a_tile = aView.load_masked(pid_m, k_block);
+            b_tile = bView.load_masked(k_block, i);
 
-                S = ct::mma(a_tile, b_tile, S);
-            }
+            S = ct::mma(a_tile, b_tile, S);
+        }
 
-            for (int r = 0; r < S.size(); r++) {
+        // Result of row_max is a TILE_M x 1 tile, with one max per row
+        auto row_max  = ct::reduce_max(S, 1_ic);
 
-                float local_max = global_max[r];
-                float expSum = global_sum[r];
+        auto new_max = ct::max(row_max, global_max);
+        auto rescale = ct::exp(global_max - new_max);
 
-                for (int c = 0; c < S[0].size(); c++) {
-                    if (S[r][c] > local_max) {
-                        local_max = S[r][c];
-                    }
-                }
-                
-                max_old[r] = global_max[r];
-                float d_old = global_sum[r];
-                max_new[r] = max(local_max, max_old[r]);
-                float d_new = d_old;
+        auto P = ct::exp(S - new_max);
+        auto tile_sum = ct::sum(P, 1_ic);
+        global_sum = global_sum * rescale + tile_sum;
+        global_max = new_max;
 
-                for (int c = 0; c < S[0].size(); c++) {
-                    expSum += std::exp(S[r][c] - max_new[r]);
-                }
-                d_new = ((d_old * std::exp(max_old[r]-max_new[r])) + expSum);
+        ct::tile<__half, ct::shape<TILE_N, TILE_K>>c_tile;
+        c_tile = cView.load_masked(i, 0);
 
-                global_max[r] = max_new[r];
-                global_sum[r] = d_new;
-                
-            }
-
-            for (int r = 0; r < S.size(); r++) {
-                for (int c = 0; c < S[0].size(); c++) {
-                    float val = S[r][c];
-                    P[r][c] = (std::exp(val-global_max[r])) / global_sum[r];
-                }
-            }
-
-            ct::tile<__half, ct::shape<TILE_N, TILE_K>>c_tile;
-            c_tile = cView.load_masked(i, 0);
-
-            for (int r = 0; r < O.size(); r++) {
-                for (int c = 0; c < O[0].size(); c++) {
-                    O[r][c] = O[r][c] * std::exp(max_old[r]-max_new[r]);                
-                }
-            }
-            O = ct::mma(P, c_tile, O);
+        O = O * rescale;
+        auto P_half = ct::element_cast<__half>(P);
+        O = ct::mma(P_half, c_tile, O);
     }
-    // Store_masked ensures that write backs only happen to elements that map to genuine positions inside C, no padding
-    // Prevents writing past the end of the C buffer 
 
-    dView.store_masked(O, pid_m, pid_n);
+    auto O_final = O / global_sum;  
+    dView.store_masked(O_final, pid_m, pid_n);
 }
 
 int main(int argc, char **argv) {
@@ -155,13 +125,29 @@ int main(int argc, char **argv) {
 
     float *host_output = new float[o_elements];
 
+    float *host_query_f32 = new float[q_elements];
+    float *host_key_f32   = new float[k_elements];
+    float *host_value_f32 = new float[v_elements];
+
+    FILE *fq = fopen("outputs/input_Q.bin", "rb");
+    FILE *fk = fopen("outputs/input_K.bin", "rb");
+    FILE *fv = fopen("outputs/input_V.bin", "rb");
+    if (!fq || !fk || !fv) {
+        printf("Error: could not open input files in outputs/\n");
+        return 1;
+    }
+    fread(host_query_f32, sizeof(float), q_elements, fq);
+    fread(host_key_f32,   sizeof(float), k_elements, fk);
+    fread(host_value_f32, sizeof(float), v_elements, fv);
+    fclose(fq); fclose(fk); fclose(fv);
+
     __half *host_query = new __half[q_elements];
     __half *host_key   = new __half[k_elements];
     __half *host_value = new __half[v_elements];
 
-    for (size_t i = 0; i < q_elements; i++) host_query[i] = __float2half((float)i);
-    for (size_t i = 0; i < k_elements; i++) host_key[i]   = __float2half((float)i);
-    for (size_t i = 0; i < v_elements; i++) host_value[i] = __float2half((float)i);
+    for (size_t i = 0; i < q_elements; i++) host_query[i] = __float2half(host_query_f32[i]);
+    for (size_t i = 0; i < k_elements; i++) host_key[i]   = __float2half(host_key_f32[i]);
+    for (size_t i = 0; i < v_elements; i++) host_value[i] = __float2half(host_value_f32[i]);
 
     __half *device_Q, *device_K, *device_V;
     float  *device_O;
@@ -212,7 +198,8 @@ int main(int argc, char **argv) {
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
     cudaFree(device_Q); cudaFree(device_K); cudaFree(device_V); cudaFree(device_O);
-    delete[] host_query; delete[] host_key; delete[] host_value; delete[] host_output;
+    delete[] host_query;     delete[] host_key;     delete[] host_value;     delete[] host_output;
+    delete[] host_query_f32; delete[] host_key_f32; delete[] host_value_f32;
 
     return 0;
 }

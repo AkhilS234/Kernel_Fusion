@@ -3,3 +3,4 @@ project(MyCUDAProject LANGUAGES CXX CUDA)
 
 add_executable(naive_attention src/naive_attention.cu)
 add_executable(flash_attn_forward src/flash_attn_forward.cu)
+add_executable(flashAttn_tile src/flashAttn_tile.cu)
