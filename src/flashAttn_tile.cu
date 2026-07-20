@@ -60,8 +60,8 @@ __tile_global__ void fused_attn_tile(const __half* A, const __half* B, const __h
 
     auto O = ct::zeros<ct::tile<float, ct::shape< TILE_M, TILE_K>>>();
 
-    auto global_max = ct::zeros<ct::tile<float, ct::shape<TILE_M>>>() - INFINITY;
-    auto global_sum = ct::zeros<ct::tile<float, ct::shape<TILE_M>>>();
+    auto global_max = ct::zeros<ct::tile<float, ct::shape<TILE_M, 1>>>() - INFINITY;
+    auto global_sum = ct::zeros<ct::tile<float, ct::shape<TILE_M, 1>>>();
 
 
     for (int i = 0; i < total_kv_blocks; i++) {
