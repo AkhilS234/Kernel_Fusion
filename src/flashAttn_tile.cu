@@ -167,7 +167,7 @@ int main(int argc, char **argv) {
     cudaEventRecord(start);
 
     dim3 gridDim((M + TILE_M - 1) / TILE_M, 1, 1);
-    fused_attn_tile<<<gridDim, 32>>>(device_Q, device_K, device_V, device_O, M, N, K, batch_size);
+    fused_attn_tile<<<gridDim, 64>>>(device_Q, device_K, device_V, device_O, M, N, K, batch_size);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
