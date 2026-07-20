@@ -82,13 +82,13 @@ __tile_global__ void fused_attn_tile(const __half* A, const __half* B, const __h
         }
 
         // Result of row_max is a TILE_M x 1 tile, with one max per row
-        auto row_max  = ct::reduce_max(S, 0_ic);
+        auto row_max  = ct::reduce_max(S, 1_ic);
 
         auto new_max = ct::max(row_max, global_max);
         auto rescale = ct::exp(global_max - new_max);
 
         auto P = ct::exp(S - new_max);
-        auto tile_sum = ct::sum(P, 0_ic);
+        auto tile_sum = ct::sum(P, 1_ic);
         global_sum = global_sum * rescale + tile_sum;
         global_max = new_max;
 
@@ -167,7 +167,7 @@ int main(int argc, char **argv) {
     cudaEventRecord(start);
 
     dim3 gridDim((M + TILE_M - 1) / TILE_M, 1, 1);
-    fused_attn_tile<<<gridDim, 1>>>(device_Q, device_K, device_V, device_O, M, N, K, batch_size);
+    fused_attn_tile<<<gridDim, 32>>>(device_Q, device_K, device_V, device_O, M, N, K, batch_size);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
