@@ -7,9 +7,9 @@
 #include <cmath>
 
 
-constexpr int TILE_M = 32;
-constexpr int TILE_N = 32;
-constexpr int TILE_K = 32;
+constexpr int TILE_M = 64;
+constexpr int TILE_N = 64;
+constexpr int TILE_K = 64;
 
 __tile_global__ void fused_attn_tile(const __half* A, const __half* B, const __half* C, float* D, int M, int N, int K, int batch_size, float qk_scale) {
     
@@ -58,56 +58,70 @@ __tile_global__ void fused_attn_tile(const __half* A, const __half* B, const __h
 
     int total_kv_blocks = ((N + batch_size - 1)/batch_size);
 
-    auto O = ct::zeros<ct::tile<float, ct::shape< TILE_M, TILE_K>>>();
+    // total_k_blocks also gives the number of TILE_K-wide chunks needed to
+    // cover the head dimension on the *output* side (O/V), reusing the same
+    // TILE_K and the same chunk count as the Q@K^T contraction loop below --
+    // it's the same head dimension K, just playing a different role
+    // (contracted there, output-width here).
+    //
+    // d_block is the outermost loop so only one O tile is ever alive at a
+    // time (avoids relying on an array of tile objects, which this API's
+    // behavior for is unverified). The cost: S and the softmax stats
+    // (global_max/global_sum) get recomputed from scratch once per d_block,
+    // i.e. total_k_blocks-fold redundant QK^T + softmax work when dim >
+    // TILE_K. Correct, not yet optimized -- fine for now, revisit if the
+    // redundant work turns out to matter.
+    for (int d_block = 0; d_block < total_k_blocks; d_block++) {
 
-    auto global_max = ct::zeros<ct::tile<float, ct::shape<TILE_M, 1>>>() - INFINITY;
-    auto global_sum = ct::zeros<ct::tile<float, ct::shape<TILE_M, 1>>>();
+        auto O = ct::zeros<ct::tile<float, ct::shape<TILE_M, TILE_K>>>();
+        auto global_max = ct::zeros<ct::tile<float, ct::shape<TILE_M, 1>>>() - INFINITY;
+        auto global_sum = ct::zeros<ct::tile<float, ct::shape<TILE_M, 1>>>();
 
+        for (int i = 0; i < total_kv_blocks; i++) {
 
-    for (int i = 0; i < total_kv_blocks; i++) {
+            auto S = ct::zeros<ct::tile<float, ct::shape<TILE_M, TILE_N>>>();
 
-        auto S = ct::zeros<ct::tile<float, ct::shape<TILE_M, TILE_N>>>();
+            for (int k_block = 0; k_block < total_k_blocks; k_block++) {
 
-        for (int k_block = 0; k_block < total_k_blocks; k_block++) {
+                ct::tile<__half, ct::shape<TILE_M, TILE_K>>a_tile;
+                ct::tile<__half, ct::shape<TILE_K, TILE_N>>b_tile;
 
-            ct::tile<__half, ct::shape<TILE_M, TILE_K>>a_tile;
-            ct::tile<__half, ct::shape<TILE_K, TILE_N>>b_tile;
+                // Load_masked ensures that it fills in zero if reading past the array's true bounds
 
-            // Load_masked ensures that it fills in zero if reading past the array's true bounds
+                a_tile = aView.load_masked(pid_m, k_block);
+                b_tile = bView.load_masked(k_block, i);
 
-            a_tile = aView.load_masked(pid_m, k_block);
-            b_tile = bView.load_masked(k_block, i);
+                S = ct::mma(a_tile, b_tile, S);
+            }
 
-            S = ct::mma(a_tile, b_tile, S);
+            // Scale raw QK^T scores by 1/sqrt(head_dim) before softmax, matching
+            // standard scaled-dot-product-attention (and PyTorch SDPA, our
+            // reference) -- this was missing entirely before. qk_scale is
+            // computed on the host (sqrtf isn't callable from __tile_global__).
+            S = S * qk_scale;
+
+            // Result of row_max is a TILE_M x 1 tile, with one max per row
+            auto row_max  = ct::reduce_max(S, 1_ic);
+
+            auto new_max = ct::max(row_max, global_max);
+            auto rescale = ct::exp(global_max - new_max);
+
+            auto P = ct::exp(S - new_max);
+            auto tile_sum = ct::sum(P, 1_ic);
+            global_sum = global_sum * rescale + tile_sum;
+            global_max = new_max;
+
+            ct::tile<__half, ct::shape<TILE_N, TILE_K>>c_tile;
+            c_tile = cView.load_masked(i, d_block);
+
+            O = O * rescale;
+            auto P_half = ct::element_cast<__half>(P);
+            O = ct::mma(P_half, c_tile, O);
         }
 
-        // Scale raw QK^T scores by 1/sqrt(head_dim) before softmax, matching
-        // standard scaled-dot-product-attention (and PyTorch SDPA, our
-        // reference) -- this was missing entirely before. qk_scale is
-        // computed on the host (sqrtf isn't callable from __tile_global__).
-        S = S * qk_scale;
-
-        // Result of row_max is a TILE_M x 1 tile, with one max per row
-        auto row_max  = ct::reduce_max(S, 1_ic);
-
-        auto new_max = ct::max(row_max, global_max);
-        auto rescale = ct::exp(global_max - new_max);
-
-        auto P = ct::exp(S - new_max);
-        auto tile_sum = ct::sum(P, 1_ic);
-        global_sum = global_sum * rescale + tile_sum;
-        global_max = new_max;
-
-        ct::tile<__half, ct::shape<TILE_N, TILE_K>>c_tile;
-        c_tile = cView.load_masked(i, 0);
-
-        O = O * rescale;
-        auto P_half = ct::element_cast<__half>(P);
-        O = ct::mma(P_half, c_tile, O);
+        auto O_final = O / global_sum;
+        dView.store_masked(O_final, pid_m, d_block);
     }
-
-    auto O_final = O / global_sum;  
-    dView.store_masked(O_final, pid_m, pid_n);
 }
 
 int main(int argc, char **argv) {
