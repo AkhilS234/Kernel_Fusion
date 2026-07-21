@@ -172,13 +172,26 @@ int main(int argc, char **argv) {
     cudaMemcpy(device_K, host_key,   k_elements * sizeof(__half), cudaMemcpyHostToDevice);
     cudaMemcpy(device_V, host_value, v_elements * sizeof(__half), cudaMemcpyHostToDevice);
 
+    dim3 gridDim((M + TILE_M - 1) / TILE_M, 1, 1);
+    float qk_scale = 1.0f / sqrtf((float)K);
+
+    // Warmup launch (untimed) -- tests whether the ~4ms cudaLaunchKernel cost
+    // seen in profiling is a one-time JIT/warmup cost or a genuine per-launch
+    // tax. If it's one-time, this call absorbs it and the timed launch below
+    // should be fast even at large N.
+    fused_attn_tile<<<gridDim, 1>>>(device_Q, device_K, device_V, device_O, M, N, K, batch_size, qk_scale);
+    cudaError_t warmup_err = cudaGetLastError();
+    if (warmup_err != cudaSuccess) {
+        printf("warmup kernel launch failed: %s\n", cudaGetErrorString(warmup_err));
+        return 1;
+    }
+    cudaDeviceSynchronize();
+
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     cudaEventRecord(start);
 
-    dim3 gridDim((M + TILE_M - 1) / TILE_M, 1, 1);
-    float qk_scale = 1.0f / sqrtf((float)K);
     fused_attn_tile<<<gridDim, 1>>>(device_Q, device_K, device_V, device_O, M, N, K, batch_size, qk_scale);
 
     cudaError_t err = cudaGetLastError();
