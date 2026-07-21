@@ -28,3 +28,4 @@ max_diff = (cuda_output-pytorch_output).abs().max().item()
 print(f"Max difference: {max_diff:.6f}")
 assert max_diff < 1e-3, f"FAILED: max diff {max_diff}"
 print("PASSED")
+

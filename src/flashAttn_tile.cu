@@ -152,10 +152,15 @@ int main(int argc, char **argv) {
     __half *device_Q, *device_K, *device_V;
     float  *device_O;
 
-    cudaMalloc(&device_Q, q_elements * sizeof(__half));
-    cudaMalloc(&device_K, k_elements * sizeof(__half));
-    cudaMalloc(&device_V, v_elements * sizeof(__half));
-    cudaMalloc(&device_O, o_elements * sizeof(float));
+    cudaError_t malloc_err;
+    malloc_err = cudaMalloc(&device_Q, q_elements * sizeof(__half));
+    if (malloc_err != cudaSuccess) { printf("cudaMalloc Q failed: %s\n", cudaGetErrorString(malloc_err)); return 1; }
+    malloc_err = cudaMalloc(&device_K, k_elements * sizeof(__half));
+    if (malloc_err != cudaSuccess) { printf("cudaMalloc K failed: %s\n", cudaGetErrorString(malloc_err)); return 1; }
+    malloc_err = cudaMalloc(&device_V, v_elements * sizeof(__half));
+    if (malloc_err != cudaSuccess) { printf("cudaMalloc V failed: %s\n", cudaGetErrorString(malloc_err)); return 1; }
+    malloc_err = cudaMalloc(&device_O, o_elements * sizeof(float));
+    if (malloc_err != cudaSuccess) { printf("cudaMalloc O failed: %s\n", cudaGetErrorString(malloc_err)); return 1; }
 
     cudaMemcpy(device_Q, host_query, q_elements * sizeof(__half), cudaMemcpyHostToDevice);
     cudaMemcpy(device_K, host_key,   k_elements * sizeof(__half), cudaMemcpyHostToDevice);
@@ -167,7 +172,7 @@ int main(int argc, char **argv) {
     cudaEventRecord(start);
 
     dim3 gridDim((M + TILE_M - 1) / TILE_M, 1, 1);
-    fused_attn_tile<<<gridDim, 64>>>(device_Q, device_K, device_V, device_O, M, N, K, batch_size);
+    fused_attn_tile<<<gridDim, 1>>>(device_Q, device_K, device_V, device_O, M, N, K, batch_size);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
