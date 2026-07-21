@@ -81,6 +81,12 @@ __tile_global__ void fused_attn_tile(const __half* A, const __half* B, const __h
             S = ct::mma(a_tile, b_tile, S);
         }
 
+        // Scale raw QK^T scores by 1/sqrt(head_dim) before softmax, matching
+        // standard scaled-dot-product-attention (and PyTorch SDPA, our
+        // reference) -- this was missing entirely before.
+        float qk_scale = 1.0f / sqrtf((float)K);
+        S = S * qk_scale;
+
         // Result of row_max is a TILE_M x 1 tile, with one max per row
         auto row_max  = ct::reduce_max(S, 1_ic);
 
