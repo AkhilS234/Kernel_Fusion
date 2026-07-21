@@ -11,7 +11,7 @@ constexpr int TILE_M = 64;
 constexpr int TILE_N = 64;
 constexpr int TILE_K = 64;
 
-__tile_global__ void fused_attn_tile(const __half* A, const __half* B, const __half* C, float* D, int M, int N, int K, int batch_size) {
+__tile_global__ void fused_attn_tile(const __half* A, const __half* B, const __half* C, float* D, int M, int N, int K, int batch_size, float qk_scale) {
     
     // M is the number of total queries, K is the head dimension, N is the number of keys/values 
 
@@ -83,8 +83,8 @@ __tile_global__ void fused_attn_tile(const __half* A, const __half* B, const __h
 
         // Scale raw QK^T scores by 1/sqrt(head_dim) before softmax, matching
         // standard scaled-dot-product-attention (and PyTorch SDPA, our
-        // reference) -- this was missing entirely before.
-        float qk_scale = 1.0f / sqrtf((float)K);
+        // reference) -- this was missing entirely before. qk_scale is
+        // computed on the host (sqrtf isn't callable from __tile_global__).
         S = S * qk_scale;
 
         // Result of row_max is a TILE_M x 1 tile, with one max per row
@@ -178,7 +178,8 @@ int main(int argc, char **argv) {
     cudaEventRecord(start);
 
     dim3 gridDim((M + TILE_M - 1) / TILE_M, 1, 1);
-    fused_attn_tile<<<gridDim, 1>>>(device_Q, device_K, device_V, device_O, M, N, K, batch_size);
+    float qk_scale = 1.0f / sqrtf((float)K);
+    fused_attn_tile<<<gridDim, 1>>>(device_Q, device_K, device_V, device_O, M, N, K, batch_size, qk_scale);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
