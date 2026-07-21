@@ -7,13 +7,13 @@
 #include <cmath>
 
 
-constexpr int TILE_M = 32;
-constexpr int TILE_N = 32;
-constexpr int TILE_K = 32;
+constexpr int TILE_M = 64;
+constexpr int TILE_N = 64;
+constexpr int TILE_K = 64;
 
-__tile_global__ void fused_attn_tile(const __half* A, const __half* B, const __half* C, float* D, int M, int N, int K, int batch_size, float qk_scale) {
-    
-    // M is the number of total queries, K is the head dimension, N is the number of keys/values 
+__tile_global__ void fused_attn_tile(const __half* A, const __half* B, const __half* C, float* D, int M, int N, int K, int batch_size, float qk_scale, int num_heads) {
+
+    // M is the number of total queries, K is the head dimension, N is the number of keys/values
 
     // Query is (M x K), Key is (N x K), Value is (N x K)
     // The output is (M x K) - M rows (one per query) and K columns (head_dim)
@@ -25,34 +25,39 @@ __tile_global__ void fused_attn_tile(const __half* A, const __half* B, const __h
 
     // a = query, b = key, c = value, d = output
 
-    auto a = ct::assume_aligned(A, 16_ic);
-    auto b = ct::assume_aligned(B, 16_ic);
-    auto c = ct::assume_aligned(C, 16_ic);
-    auto d = ct::assume_aligned(D, 16_ic);
+    // Grid dims: x = query row-tile, y = head, z = batch (same convention as
+    // flash_attn_forward.cu). Offset the base pointers by head/batch stride
+    // before building the views, so every downstream tile op operates on
+    // this block's own (batch, head) slice without knowing batch/head exist.
+    auto [pid_m, head_idx, batch_idx] = ct::bid();
+
+    size_t head_stride  = (size_t)N * K;
+    size_t batch_stride = (size_t)num_heads * head_stride;
+    size_t offset = batch_idx * batch_stride + head_idx * head_stride;
+
+    auto a = ct::assume_aligned(A + offset, 16_ic);
+    auto b = ct::assume_aligned(B + offset, 16_ic);
+    auto c = ct::assume_aligned(C + offset, 16_ic);
+    auto d = ct::assume_aligned(D + offset, 16_ic);
 
     auto aShape = ct::extents{M, K};
     auto bShape = ct::extents{K, N};
     auto cShape = ct::extents{N, K};
     auto dShape = ct::extents{M, K};
 
-    // Tensor span attaches shape to a pointer to an array that already exists in memory 
+    // Tensor span attaches shape to a pointer to an array that already exists in memory
 
     auto aSpan = ct::tensor_span{a, aShape};
     auto bSpan = ct::tensor_span{b, bShape};
     auto cSpan = ct::tensor_span{c, cShape};
     auto dSpan = ct::tensor_span{d, dShape};
 
-    // Partition view defines how that array is defined into TILE_M x TILE_K sized chunks 
+    // Partition view defines how that array is defined into TILE_M x TILE_K sized chunks
 
     auto aView = ct::partition_view{aSpan, ct::shape<TILE_M, TILE_K>{}};
     auto bView = ct::partition_view{bSpan, ct::shape<TILE_K, TILE_N>{}};
     auto cView = ct::partition_view{cSpan, ct::shape<TILE_N, TILE_K>{}};
     auto dView = ct::partition_view{dSpan, ct::shape<TILE_M, TILE_K>{}};
-
-    // Find block's row and tile indices 
-    //pid_m picks a size-defined chunk of rows out of Q, and therefore the same-numbered chunk of rows in the output 
-
-    auto [pid_m, pid_n, dummy] = ct::bid();
 
     int total_k_blocks = (K + TILE_K - 1) / TILE_K;
 
@@ -126,9 +131,15 @@ __tile_global__ void fused_attn_tile(const __half* A, const __half* B, const __h
 
 int main(int argc, char **argv) {
 
+    // CLI order matches flash_attn_forward.cu: N, dim, batch, num_heads.
+    // batch_size (the KV-tile chunk size used inside the kernel's outer loop
+    // -- unrelated to the "batch" dimension here despite the name) moves to
+    // an optional 5th arg so it doesn't collide with the new real batch dim.
     int N          = argc > 1 ? atoi(argv[1]) : 1024;
     int dim        = argc > 2 ? atoi(argv[2]) : 64;
-    int batch_size = argc > 3 ? atoi(argv[3]) : TILE_N;
+    int num_batches= argc > 3 ? atoi(argv[3]) : 1;
+    int num_heads  = argc > 4 ? atoi(argv[4]) : 1;
+    int batch_size = argc > 5 ? atoi(argv[5]) : TILE_N;
 
     int M = N;
     int K = dim;
@@ -138,10 +149,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    size_t q_elements = (size_t)M * K;
-    size_t k_elements = (size_t)K * N;
-    size_t v_elements = (size_t)N * K;
-    size_t o_elements = (size_t)M * K;
+    size_t q_elements = (size_t)num_batches * num_heads * M * K;
+    size_t k_elements = (size_t)num_batches * num_heads * K * N;
+    size_t v_elements = (size_t)num_batches * num_heads * N * K;
+    size_t o_elements = (size_t)num_batches * num_heads * M * K;
 
     float *host_output = new float[o_elements];
 
@@ -186,14 +197,16 @@ int main(int argc, char **argv) {
     cudaMemcpy(device_K, host_key,   k_elements * sizeof(__half), cudaMemcpyHostToDevice);
     cudaMemcpy(device_V, host_value, v_elements * sizeof(__half), cudaMemcpyHostToDevice);
 
-    dim3 gridDim((M + TILE_M - 1) / TILE_M, 1, 1);
+    // Grid: x = query row-tile, y = head, z = batch -- same convention as
+    // flash_attn_forward.cu.
+    dim3 gridDim((M + TILE_M - 1) / TILE_M, num_heads, num_batches);
     float qk_scale = 1.0f / sqrtf((float)K);
 
     // Warmup launch (untimed) -- tests whether the ~4ms cudaLaunchKernel cost
     // seen in profiling is a one-time JIT/warmup cost or a genuine per-launch
     // tax. If it's one-time, this call absorbs it and the timed launch below
     // should be fast even at large N.
-    fused_attn_tile<<<gridDim, 1>>>(device_Q, device_K, device_V, device_O, M, N, K, batch_size, qk_scale);
+    fused_attn_tile<<<gridDim, 1>>>(device_Q, device_K, device_V, device_O, M, N, K, batch_size, qk_scale, num_heads);
     cudaError_t warmup_err = cudaGetLastError();
     if (warmup_err != cudaSuccess) {
         printf("warmup kernel launch failed: %s\n", cudaGetErrorString(warmup_err));
@@ -206,7 +219,7 @@ int main(int argc, char **argv) {
     cudaEventCreate(&stop);
     cudaEventRecord(start);
 
-    fused_attn_tile<<<gridDim, 1>>>(device_Q, device_K, device_V, device_O, M, N, K, batch_size, qk_scale);
+    fused_attn_tile<<<gridDim, 1>>>(device_Q, device_K, device_V, device_O, M, N, K, batch_size, qk_scale, num_heads);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {

@@ -13,9 +13,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 BUILD_DIR = REPO_ROOT / "build"
 OUTPUTS_DIR = REPO_ROOT / "outputs"
 
-# flashAttn_tile.cu hard-codes TILE_K=64 and doesn't loop the O/V accumulation
-# over multiple head-dim chunks, so it only works correctly at dim=64.
-TILE_DIM = 64
+# flashAttn_tile.cu now loops its O/V accumulation over multiple TILE_K-wide
+# chunks, so dim just needs to be a multiple of TILE_K (64) -- 64 and 128 both
+# work now, not just 64.
 
 
 def run_binary(cmd, output_file, output_shape, n_warmup=5):
@@ -30,21 +30,19 @@ def run_binary(cmd, output_file, output_shape, n_warmup=5):
     return ms, output
 
 
-def run_tiled(N, dim, n_warmup=5):
-    cmd = [str(BUILD_DIR / "flashAttn_tile"), str(N), str(dim)]
-    return run_binary(cmd, "output_S.bin", (N, dim), n_warmup=n_warmup)
+def run_tiled(N, dim, batch=1, heads=1, n_warmup=5):
+    cmd = [str(BUILD_DIR / "flashAttn_tile"), str(N), str(dim), str(batch), str(heads)]
+    return run_binary(cmd, "output_S.bin", (batch, heads, N, dim), n_warmup=n_warmup)
 
 
-def run_flash_attn_forward(N, dim, n_warmup=5):
-    cmd = [str(BUILD_DIR / "flash_attn_forward"), str(N), str(dim), "1", "1"]
-    ms, out = run_binary(cmd, "output_S.bin", (1, 1, N, dim), n_warmup=n_warmup)
-    return ms, out.squeeze(0).squeeze(0)
+def run_flash_attn_forward(N, dim, batch=1, heads=1, n_warmup=5):
+    cmd = [str(BUILD_DIR / "flash_attn_forward"), str(N), str(dim), str(batch), str(heads)]
+    return run_binary(cmd, "output_S.bin", (batch, heads, N, dim), n_warmup=n_warmup)
 
 
-def run_naive(N, dim, n_warmup=1):
-    cmd = [str(BUILD_DIR / "naive_attention"), str(N), str(dim), "1", "1"]
-    ms, out = run_binary(cmd, "naive_output.bin", (1, 1, N, dim), n_warmup=n_warmup)
-    return ms, out.squeeze(0).squeeze(0)
+def run_naive(N, dim, batch=1, heads=1, n_warmup=1):
+    cmd = [str(BUILD_DIR / "naive_attention"), str(N), str(dim), str(batch), str(heads)]
+    return run_binary(cmd, "naive_output.bin", (batch, heads, N, dim), n_warmup=n_warmup)
 
 
 def sdpa_ms(Q, K, V, n_runs=20):
@@ -65,16 +63,24 @@ def sdpa_ms(Q, K, V, n_runs=20):
     return elapsed_ms, out.cpu()
 
 
-def write_inputs(Q, K, V):
-    # flashAttn_tile expects Q as (N x dim), K TRANSPOSED as (dim x N)
-    # (bShape = {K, N} in the kernel), and V as (N x dim).
+def write_tiled_inputs(Q, K, V):
+    # flashAttn_tile expects Q as (batch, heads, N, dim), K TRANSPOSED on its
+    # last two dims (bShape = {K, N} per (batch, head) slice in the kernel),
+    # and V as (batch, heads, N, dim) -- same shape as Q.
     Q.numpy().tofile(OUTPUTS_DIR / "input_Q.bin")
-    K.transpose(0, 1).contiguous().numpy().tofile(OUTPUTS_DIR / "input_K.bin")
+    K.transpose(-2, -1).contiguous().numpy().tofile(OUTPUTS_DIR / "input_K.bin")
     V.numpy().tofile(OUTPUTS_DIR / "input_V.bin")
 
 
-def sweep(seq_lens, run_naive_flag=False, run_wmma_flag=True, naive_n_warmup=1):
-    cols = ["N", "dim"]
+def write_untransposed_inputs(Q, K, V):
+    # naive_attention.cu / flash_attn_forward.cu expect K untransposed.
+    Q.numpy().tofile(OUTPUTS_DIR / "input_Q.bin")
+    K.numpy().tofile(OUTPUTS_DIR / "input_K.bin")
+    V.numpy().tofile(OUTPUTS_DIR / "input_V.bin")
+
+
+def sweep(seq_lens, dim=64, batch=1, heads=1, run_naive_flag=False, run_wmma_flag=True, naive_n_warmup=1):
+    cols = ["N", "dim", "batch", "heads"]
     if run_naive_flag:
         cols += ["naive(ms)"]
     if run_wmma_flag:
@@ -84,52 +90,50 @@ def sweep(seq_lens, run_naive_flag=False, run_wmma_flag=True, naive_n_warmup=1):
     print(header)
 
     for N in seq_lens:
-        dim = TILE_DIM
-        Q = torch.randn(N, dim, dtype=torch.float32)
-        K = torch.randn(N, dim, dtype=torch.float32)
-        V = torch.randn(N, dim, dtype=torch.float32)
+        Q = torch.randn(batch, heads, N, dim, dtype=torch.float32)
+        K = torch.randn(batch, heads, N, dim, dtype=torch.float32)
+        V = torch.randn(batch, heads, N, dim, dtype=torch.float32)
 
-        write_inputs(Q, K, V)
-        tiled_time, _ = run_tiled(N, dim)
+        write_tiled_inputs(Q, K, V)
+        tiled_time, _ = run_tiled(N, dim, batch=batch, heads=heads)
 
-        Q_sdpa = Q.unsqueeze(0).unsqueeze(0)
-        K_sdpa = K.unsqueeze(0).unsqueeze(0)
-        V_sdpa = V.unsqueeze(0).unsqueeze(0)
-        sdpa_time, _ = sdpa_ms(Q_sdpa, K_sdpa, V_sdpa)
+        sdpa_time, _ = sdpa_ms(Q, K, V)
         tiled_vs_sdpa = tiled_time / sdpa_time
 
-        row = [f"{N:>12}", f"{dim:>12}"]
+        row = [f"{N:>12}", f"{dim:>12}", f"{batch:>12}", f"{heads:>12}"]
 
         if run_naive_flag:
-            # naive_attention.cu reads Q/K/V untransposed -- rewrite K in that
-            # layout right before calling it, then restore the tiled layout
-            # in case another tiled run follows in the same sweep.
-            K.numpy().tofile(OUTPUTS_DIR / "input_K.bin")
-            naive_time, _ = run_naive(N, dim, n_warmup=naive_n_warmup)
+            write_untransposed_inputs(Q, K, V)
+            naive_time, _ = run_naive(N, dim, batch=batch, heads=heads, n_warmup=naive_n_warmup)
             row.append(f"{naive_time:>12.3f}")
-            K.transpose(0, 1).contiguous().numpy().tofile(OUTPUTS_DIR / "input_K.bin")
+            write_tiled_inputs(Q, K, V)
 
         if run_wmma_flag:
-            K.numpy().tofile(OUTPUTS_DIR / "input_K.bin")
-            wmma_time, _ = run_flash_attn_forward(N, dim)
+            write_untransposed_inputs(Q, K, V)
+            wmma_time, _ = run_flash_attn_forward(N, dim, batch=batch, heads=heads)
             row.append(f"{wmma_time:>12.3f}")
-            K.transpose(0, 1).contiguous().numpy().tofile(OUTPUTS_DIR / "input_K.bin")
+            write_tiled_inputs(Q, K, V)
 
         row += [f"{tiled_time:>12.3f}", f"{sdpa_time:>12.3f}", f"{tiled_vs_sdpa:>11.2f}x"]
         print(" ".join(row))
 
 
 if __name__ == "__main__":
-    print("=== tiled flash attention vs sdpa (dim fixed at 64 -- TILE_K limit) ===")
+    print("=== tiled flash attention vs sdpa (dim=64, single head/batch) ===")
     sweep(
         seq_lens=[1024, 2048, 4096, 8192],
+        dim=64,
         run_naive_flag=False,
         run_wmma_flag=True,
     )
 
-    print("\n=== showcase: naive vs wmma vs tiled vs sdpa ===")
+    print("\n=== experimental progression: naive -> wmma -> tiled, matching the")
+    print("=== original benchmark shape (N=2048, dim=128, heads=8, batch=2) ===")
     sweep(
         seq_lens=[2048],
+        dim=128,
+        batch=2,
+        heads=8,
         run_naive_flag=True,
         run_wmma_flag=True,
         naive_n_warmup=1,
