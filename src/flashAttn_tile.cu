@@ -7,9 +7,9 @@
 #include <cmath>
 
 
-constexpr int TILE_M = 64;
-constexpr int TILE_N = 64;
-constexpr int TILE_K = 64;
+constexpr int TILE_M = 32;
+constexpr int TILE_N = 32;
+constexpr int TILE_K = 32;
 
 __tile_global__ void fused_attn_tile(const __half* A, const __half* B, const __half* C, float* D, int M, int N, int K, int batch_size, float qk_scale) {
     
