@@ -13,22 +13,9 @@ constexpr int TILE_K = 64;
 
 __tile_global__ void fused_attn_tile(const __half* A, const __half* B, const __half* C, float* D, int M, int N, int K, int batch_size, float qk_scale, int num_heads) {
 
-    // M is the number of total queries, K is the head dimension, N is the number of keys/values
-
-    // Query is (M x K), Key is (N x K), Value is (N x K)
-    // The output is (M x K) - M rows (one per query) and K columns (head_dim)
-
     namespace ct = cuda::tiles;
     using namespace ct::literals;
 
-    // TILE_BLOCK is the fixed size unit of work one block does per step, M/N/K determine how many of those units are needed in total
-
-    // a = query, b = key, c = value, d = output
-
-    // Grid dims: x = query row-tile, y = head, z = batch (same convention as
-    // flash_attn_forward.cu). Offset the base pointers by head/batch stride
-    // before building the views, so every downstream tile op operates on
-    // this block's own (batch, head) slice without knowing batch/head exist.
     auto [pid_m, head_idx, batch_idx] = ct::bid();
 
     size_t head_stride  = (size_t)N * K;
@@ -45,14 +32,10 @@ __tile_global__ void fused_attn_tile(const __half* A, const __half* B, const __h
     auto cShape = ct::extents{N, K};
     auto dShape = ct::extents{M, K};
 
-    // Tensor span attaches shape to a pointer to an array that already exists in memory
-
     auto aSpan = ct::tensor_span{a, aShape};
     auto bSpan = ct::tensor_span{b, bShape};
     auto cSpan = ct::tensor_span{c, cShape};
     auto dSpan = ct::tensor_span{d, dShape};
-
-    // Partition view defines how that array is defined into TILE_M x TILE_K sized chunks
 
     auto aView = ct::partition_view{aSpan, ct::shape<TILE_M, TILE_K>{}};
     auto bView = ct::partition_view{bSpan, ct::shape<TILE_K, TILE_N>{}};
@@ -63,19 +46,6 @@ __tile_global__ void fused_attn_tile(const __half* A, const __half* B, const __h
 
     int total_kv_blocks = ((N + batch_size - 1)/batch_size);
 
-    // total_k_blocks also gives the number of TILE_K-wide chunks needed to
-    // cover the head dimension on the *output* side (O/V), reusing the same
-    // TILE_K and the same chunk count as the Q@K^T contraction loop below --
-    // it's the same head dimension K, just playing a different role
-    // (contracted there, output-width here).
-    //
-    // d_block is the outermost loop so only one O tile is ever alive at a
-    // time (avoids relying on an array of tile objects, which this API's
-    // behavior for is unverified). The cost: S and the softmax stats
-    // (global_max/global_sum) get recomputed from scratch once per d_block,
-    // i.e. total_k_blocks-fold redundant QK^T + softmax work when dim >
-    // TILE_K. Correct, not yet optimized -- fine for now, revisit if the
-    // redundant work turns out to matter.
     for (int d_block = 0; d_block < total_k_blocks; d_block++) {
 
         auto O = ct::zeros<ct::tile<float, ct::shape<TILE_M, TILE_K>>>();
@@ -91,21 +61,14 @@ __tile_global__ void fused_attn_tile(const __half* A, const __half* B, const __h
                 ct::tile<__half, ct::shape<TILE_M, TILE_K>>a_tile;
                 ct::tile<__half, ct::shape<TILE_K, TILE_N>>b_tile;
 
-                // Load_masked ensures that it fills in zero if reading past the array's true bounds
-
                 a_tile = aView.load_masked(pid_m, k_block);
                 b_tile = bView.load_masked(k_block, i);
 
                 S = ct::mma(a_tile, b_tile, S);
             }
 
-            // Scale raw QK^T scores by 1/sqrt(head_dim) before softmax, matching
-            // standard scaled-dot-product-attention (and PyTorch SDPA, our
-            // reference) -- this was missing entirely before. qk_scale is
-            // computed on the host (sqrtf isn't callable from __tile_global__).
             S = S * qk_scale;
 
-            // Result of row_max is a TILE_M x 1 tile, with one max per row
             auto row_max  = ct::reduce_max(S, 1_ic);
 
             auto new_max = ct::max(row_max, global_max);
@@ -131,10 +94,6 @@ __tile_global__ void fused_attn_tile(const __half* A, const __half* B, const __h
 
 int main(int argc, char **argv) {
 
-    // CLI order matches flash_attn_forward.cu: N, dim, batch, num_heads.
-    // batch_size (the KV-tile chunk size used inside the kernel's outer loop
-    // -- unrelated to the "batch" dimension here despite the name) moves to
-    // an optional 5th arg so it doesn't collide with the new real batch dim.
     int N          = argc > 1 ? atoi(argv[1]) : 1024;
     int dim        = argc > 2 ? atoi(argv[2]) : 64;
     int num_batches= argc > 3 ? atoi(argv[3]) : 1;
@@ -197,15 +156,9 @@ int main(int argc, char **argv) {
     cudaMemcpy(device_K, host_key,   k_elements * sizeof(__half), cudaMemcpyHostToDevice);
     cudaMemcpy(device_V, host_value, v_elements * sizeof(__half), cudaMemcpyHostToDevice);
 
-    // Grid: x = query row-tile, y = head, z = batch -- same convention as
-    // flash_attn_forward.cu.
     dim3 gridDim((M + TILE_M - 1) / TILE_M, num_heads, num_batches);
     float qk_scale = 1.0f / sqrtf((float)K);
 
-    // Warmup launch (untimed) -- tests whether the ~4ms cudaLaunchKernel cost
-    // seen in profiling is a one-time JIT/warmup cost or a genuine per-launch
-    // tax. If it's one-time, this call absorbs it and the timed launch below
-    // should be fast even at large N.
     fused_attn_tile<<<gridDim, 1>>>(device_Q, device_K, device_V, device_O, M, N, K, batch_size, qk_scale, num_heads);
     cudaError_t warmup_err = cudaGetLastError();
     if (warmup_err != cudaSuccess) {

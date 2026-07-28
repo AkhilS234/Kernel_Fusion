@@ -13,10 +13,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 BUILD_DIR = REPO_ROOT / "build"
 OUTPUTS_DIR = REPO_ROOT / "outputs"
 
-# flashAttn_tile.cu now loops its O/V accumulation over multiple TILE_K-wide
-# chunks, so dim just needs to be a multiple of TILE_K (64) -- 64 and 128 both
-# work now, not just 64.
-
 
 def run_binary(cmd, output_file, output_shape, n_warmup=5):
     for _ in range(n_warmup):
@@ -64,16 +60,12 @@ def sdpa_ms(Q, K, V, n_runs=20):
 
 
 def write_tiled_inputs(Q, K, V):
-    # flashAttn_tile expects Q as (batch, heads, N, dim), K TRANSPOSED on its
-    # last two dims (bShape = {K, N} per (batch, head) slice in the kernel),
-    # and V as (batch, heads, N, dim) -- same shape as Q.
     Q.numpy().tofile(OUTPUTS_DIR / "input_Q.bin")
     K.transpose(-2, -1).contiguous().numpy().tofile(OUTPUTS_DIR / "input_K.bin")
     V.numpy().tofile(OUTPUTS_DIR / "input_V.bin")
 
 
 def write_untransposed_inputs(Q, K, V):
-    # naive_attention.cu / flash_attn_forward.cu expect K untransposed.
     Q.numpy().tofile(OUTPUTS_DIR / "input_Q.bin")
     K.numpy().tofile(OUTPUTS_DIR / "input_K.bin")
     V.numpy().tofile(OUTPUTS_DIR / "input_V.bin")
